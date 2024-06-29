@@ -1,5 +1,5 @@
 [package]
-name = "firecracker_fuzzer"
+name = "nyx-lite"
 version = "0.1.0"
 edition = "2021"
 

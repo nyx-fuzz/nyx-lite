@@ -5,7 +5,6 @@ Experimenting with firecracker for snapshot fuzzing
 Setup:
 -----
 
-0) Compile firecracker in ../firecracker
 1) Install Docker (you may or may not want to follow the installation steps in `dockerfile/install-docker.sh`, whatever
 way works for you)
 2) Run `dockerfile/build-img.sh`, this will extract a rootfs from the fockerfile. It will call initscript-fuzz-setup.sh
