@@ -6,6 +6,7 @@ COPY interfaces.txt /etc/network/interfaces
 COPY initscript-fuzz-setup.sh /etc/init.d/fuzz-setup
 RUN  chmod +x /etc/init.d/fuzz-setup
 COPY ./key.pub /root/.ssh/authorized_keys
+COPY ./resources /resources
 
 RUN echo "basic services" \
  && ln -s agetty /etc/init.d/agetty.ttyS0 \

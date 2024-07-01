@@ -1,6 +1,11 @@
 set -e
+
+
+rustc --target=x86_64-unknown-linux-musl ../../examples/test_swbp.rs -o resources/test_swbp
+
 IMG_ID=$(docker build -q .)
 CONTAINER_ID=$(docker run -td $IMG_ID /bin/bash)
+
 
 MOUNTDIR=mnt
 FS=rootfs.ext4

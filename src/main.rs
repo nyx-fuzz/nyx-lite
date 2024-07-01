@@ -4,6 +4,8 @@ extern crate event_manager;
 extern crate libc;
 extern crate thiserror;
 extern crate anyhow;
+extern crate kvm_ioctls;
+extern crate kvm_bindings;
 
 use std::fs::{self, File};
 use std::path::PathBuf;
@@ -19,6 +21,7 @@ use seccompiler::BpfThreadMap;
 use utils::arg_parser::{ArgParser, Argument};
 use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
+use utils::time::TimestampUs;
 use vmm::builder::StartMicrovmError;
 use vmm::logger::{
     debug, error, info, LoggerConfig, ProcessTimeReporter, StoreMetric, LOGGER,
@@ -30,6 +33,17 @@ use vmm::snapshot::{Snapshot, SnapshotError};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
 use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
+use vmm::VmmError;
+use vmm::vstate::memory::GuestMemoryMmap;
+use vmm::Vmm;
+use vmm::resources;
+use vmm::vstate::memory::GuestMemoryExtension;
+use vmm::cpu_config::templates::GetCpuTemplate;
+
+use kvm_ioctls::Kvm;
+use kvm_bindings::{
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug_arch, kvm_guest_debug
+};
 
 fn main() -> ExitCode {
     let result = main_exec();
@@ -70,7 +84,7 @@ fn main_exec() -> Result<()> {
     let mut arg_parser =
         ArgParser::new()
             .arg(
-                Argument::new("config-file")
+                Argument::new("config")
                     .takes_value(true)
                     .help("Path to a file that contains the microVM configuration in JSON format."),
             )
@@ -173,7 +187,7 @@ fn main_exec() -> Result<()> {
     }
 
     let vmm_config_json = arguments
-        .single_value("config-file")
+        .single_value("config")
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
@@ -251,6 +265,183 @@ fn resize_fdtable() -> Result<(), ResizeFdTableError> {
 }
 
 
+
+/// Builds and starts a microVM based on the current Firecracker VmResources configuration.
+///
+/// The built microVM and all the created vCPUs start off in the paused state.
+/// To boot the microVM and run those vCPUs, `Vmm::resume_vm()` needs to be
+/// called.
+pub fn build_microvm_for_boot(
+    instance_info: &InstanceInfo,
+    vm_resources: &VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    // Timestamp for measuring microVM boot duration.
+    let request_ts = TimestampUs::default();
+
+    let boot_config = vm_resources
+        .boot_source_builder()
+        .ok_or(MissingKernelConfig)?;
+
+    let track_dirty_pages = vm_resources.track_dirty_pages();
+
+    let vhost_user_device_used = vm_resources
+        .block
+        .devices
+        .iter()
+        .any(|b| b.lock().expect("Poisoned lock").is_vhost_user());
+
+    // Page faults are more expensive for shared memory mapping, including  memfd.
+    // For this reason, we only back guest memory with a memfd
+    // if a vhost-user-blk device is configured in the VM, otherwise we fall back to
+    // an anonymous private memory.
+    //
+    // The vhost-user-blk branch is not currently covered by integration tests in Rust,
+    // because that would require running a backend process. If in the future we converge to
+    // a single way of backing guest memory for vhost-user and non-vhost-user cases,
+    // that would not be worth the effort.
+    let guest_memory = if vhost_user_device_used {
+        GuestMemoryMmap::memfd_backed(
+            vm_resources.vm_config.mem_size_mib,
+            track_dirty_pages,
+            vm_resources.vm_config.huge_pages,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?
+    } else {
+        let regions = vmm::arch::arch_memory_regions(vm_resources.vm_config.mem_size_mib << 20);
+        GuestMemoryMmap::from_raw_regions(
+            &regions,
+            track_dirty_pages,
+            vm_resources.vm_config.huge_pages,
+        )
+        .map_err(StartMicrovmError::GuestMemory)?
+    };
+
+    let entry_addr = vmm::builder::load_kernel(boot_config, &guest_memory)?;
+    let initrd = vmm::builder::load_initrd_from_config(boot_config, &guest_memory)?;
+    // Clone the command-line so that a failed boot doesn't pollute the original.
+    #[allow(unused_mut)]
+    let mut boot_cmdline = boot_config.cmdline.clone();
+
+    let cpu_template = vm_resources.vm_config.cpu_template.get_cpu_template()?;
+
+    let (mut vmm, mut vcpus) = vmm::builder::create_vmm_and_vcpus(
+        instance_info,
+        event_manager,
+        guest_memory,
+        None,
+        track_dirty_pages,
+        vm_resources.vm_config.vcpu_count,
+        cpu_template.kvm_capabilities.clone(),
+    )?;
+
+    /// BEGIN NYX-LITE PATCH
+
+    let debug_struct = kvm_guest_debug {
+        // Configure the vcpu so that a KVM_DEBUG_EXIT would be generated
+        // when encountering a software breakpoint during execution
+        control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+        pad: 0,
+        // Reset all arch-specific debug registers
+        arch: Default::default(),
+    };
+    
+    vcpus[0].kvm_vcpu.fd.set_guest_debug(&debug_struct).unwrap();
+    /// END NYX-LITE PATCH
+
+    // The boot timer device needs to be the first device attached in order
+    // to maintain the same MMIO address referenced in the documentation
+    // and tests.
+    if vm_resources.boot_timer {
+        vmm::builder::attach_boot_timer_device(&mut vmm, request_ts)?;
+    }
+
+    vmm::builder::attach_block_devices(
+        &mut vmm,
+        &mut boot_cmdline,
+        vm_resources.block.devices.iter(),
+        event_manager,
+    )?;
+    vmm::builder::attach_net_devices(
+        &mut vmm,
+        &mut boot_cmdline,
+        vm_resources.net_builder.iter(),
+        event_manager,
+    )?;
+
+
+    #[cfg(target_arch = "x86_64")]
+    vmm::builder::attach_vmgenid_device(&mut vmm)?;
+
+    vmm::builder::configure_system_for_boot(
+        &mut vmm,
+        vcpus.as_mut(),
+        &vm_resources.vm_config,
+        &cpu_template,
+        entry_addr,
+        &initrd,
+        boot_cmdline,
+    )?;
+
+    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+    vmm.start_vcpus(
+        vcpus,
+        seccomp_filters
+            .get("vcpu")
+            .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
+            .clone(),
+    )
+    .map_err(VmmError::VcpuStart)
+    .map_err(Internal)?;
+
+    // Load seccomp filters for the VMM thread.
+    // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
+    // altogether is the desired behaviour.
+    // Keep this as the last step before resuming vcpus.
+    seccompiler::apply_filter(
+        seccomp_filters
+            .get("vmm")
+            .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
+    )
+    .map_err(VmmError::SeccompFilters)
+    .map_err(Internal)?;
+
+    let vmm = Arc::new(Mutex::new(vmm));
+    event_manager.add_subscriber(vmm.clone());
+
+    Ok(vmm)
+}
+
+
+/// Builds and boots a microVM based on the current Firecracker VmResources configuration.
+///
+/// This is the default build recipe, one could build other microVM flavors by using the
+/// independent functions in this module instead of calling this recipe.
+///
+/// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
+/// is returned.
+pub fn build_and_boot_microvm(
+    instance_info: &InstanceInfo,
+    vm_resources: &VmResources,
+    event_manager: &mut EventManager,
+    seccomp_filters: &BpfThreadMap,
+) -> Result<Arc<Mutex<vmm::Vmm>>, StartMicrovmError> {
+    debug!("event_start: build microvm for boot");
+    let vmm = vmm::builder::build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
+    debug!("event_end: build microvm for boot");
+    // The vcpus start off in the `Paused` state, let them run.
+    debug!("event_start: boot microvm");
+    vmm.lock()
+        .unwrap()
+        .resume_vm()
+        .map_err(StartMicrovmError::Internal)?;
+    debug!("event_end: boot microvm");
+    Ok(vmm)
+}
+
 // Configure and start a microVM as described by the command-line JSON.
 fn build_microvm_from_json(
     seccomp_filters: &BpfThreadMap,
@@ -264,13 +455,13 @@ fn build_microvm_from_json(
     let mut vm_resources =
         VmResources::from_json(&config_json, &instance_info, mmds_size_limit, metadata_json)?;
     vm_resources.boot_timer = boot_timer_enabled;
-    let vmm = vmm::builder::build_and_boot_microvm(
+    let vmm = build_and_boot_microvm(
         &instance_info,
         &vm_resources,
         event_manager,
         seccomp_filters,
     )?;
-
+    
     info!("Successfully started microvm that was configured from one single json");
 
     Ok((vm_resources, vmm))
@@ -302,12 +493,15 @@ fn run_without_api(
         event_manager
             .run()
             .expect("Failed to start the event manager");
-
         match vmm.lock().unwrap().shutdown_exit_code() {
             Some(FcExitCode::Ok) => break,
             Some(exit_code) => return Err(anyhow::anyhow!("Shutting down with exit code: {:?}", exit_code)),
             None => continue,
         }
+        //use std::time::Duration;
+        //println!("wait for breakpoint");
+        //vmm.lock().unwrap().wait_for_hypercall(Duration::from_millis(10)).expect("was waiting for hypercall, wtf?");
+        //println!("wait for breakpoint");
     }
     Ok(())
 }

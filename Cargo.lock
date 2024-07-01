@@ -5,7 +5,6 @@ version = 3
 [[package]]
 name = "acpi_tables"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/firecracker#6d6caf4fa03d0e34c72823e3d45a8c4ab181a2a3"
 dependencies = [
  "displaydoc",
  "thiserror",
@@ -335,7 +334,6 @@ dependencies = [
 [[package]]
 name = "firecracker"
 version = "1.9.0-dev"
-source = "git+https://github.com/firecracker-microvm/firecracker#6d6caf4fa03d0e34c72823e3d45a8c4ab181a2a3"
 dependencies = [
  "bincode",
  "displaydoc",
@@ -566,6 +564,8 @@ dependencies = [
  "displaydoc",
  "event-manager",
  "firecracker",
+ "kvm-bindings",
+ "kvm-ioctls",
  "libc",
  "seccompiler",
  "thiserror",
@@ -694,7 +694,6 @@ checksum = "f3cb5ba0dc43242ce17de99c180e96db90b235b8a9fdc9543c96d2209116bd9f"
 [[package]]
 name = "seccompiler"
 version = "1.9.0-dev"
-source = "git+https://github.com/firecracker-microvm/firecracker#6d6caf4fa03d0e34c72823e3d45a8c4ab181a2a3"
 dependencies = [
  "bincode",
  "displaydoc",
@@ -868,7 +867,6 @@ dependencies = [
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/firecracker#6d6caf4fa03d0e34c72823e3d45a8c4ab181a2a3"
 dependencies = [
  "derive_more",
  "displaydoc",
@@ -933,7 +931,6 @@ checksum = "3428ee25acbfc75ed14600f2043876e0889cbd57c39dd441191417377cdceda0"
 [[package]]
 name = "vmm"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/firecracker#6d6caf4fa03d0e34c72823e3d45a8c4ab181a2a3"
 dependencies = [
  "acpi_tables",
  "aes-gcm",

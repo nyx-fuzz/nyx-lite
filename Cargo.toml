@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-firecracker = { git = "https://github.com/firecracker-microvm/firecracker" }
-vmm = { git = "https://github.com/firecracker-microvm/firecracker" }
-utils= { git = "https://github.com/firecracker-microvm/firecracker" }
-seccompiler= { git = "https://github.com/firecracker-microvm/firecracker" }
+#firecracker = { git = "https://github.com/firecracker-microvm/firecracker" }
+firecracker = { path = "../firecracker-nyx-patches/src/firecracker"}
+vmm = { path = "../firecracker-nyx-patches/src/vmm"}
+utils= { path = "../firecracker-nyx-patches/src/utils" }
+seccompiler= { path = "../firecracker-nyx-patches/src/seccompiler"}
 event-manager = "0.4.0"
 libc = "0.2.155"
 anyhow ="1.0.86"
 thiserror="1.0.61"
 displaydoc = "0.2.5"
+kvm-bindings = { version = "0.8.0", features = ["fam-wrappers", "serde"] }
+kvm-ioctls = "0.17.0"

@@ -26,6 +26,8 @@ start() {
   mkdir /dev/pts
   mount devpts /dev/pts -t devpts
   #start sshd
-  rc-service sshd start
+  #rc-service sshd start
+  /resources/test_swbp
+  reboot
 	return 0
 }
