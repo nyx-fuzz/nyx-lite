@@ -36,9 +36,11 @@ use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
 use vmm::VmmError;
 use vmm::vstate::memory::GuestMemoryMmap;
 use vmm::Vmm;
+use vmm::Vcpu;
 use vmm::resources;
 use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::cpu_config::templates::GetCpuTemplate;
+use vmm::vstate::vcpu::VcpuEmulation;
 
 use kvm_ioctls::Kvm;
 use kvm_bindings::{
@@ -276,7 +278,7 @@ pub fn build_microvm_for_boot(
     vm_resources: &VmResources,
     event_manager: &mut EventManager,
     seccomp_filters: &BpfThreadMap,
-) -> Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+) -> Result<(Arc<Mutex<Vmm>>, Vcpu), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
     // Timestamp for measuring microVM boot duration.
@@ -339,7 +341,7 @@ pub fn build_microvm_for_boot(
     )?;
 
     /// BEGIN NYX-LITE PATCH
-
+    assert_eq!(vcpus.len(), 1);
     let debug_struct = kvm_guest_debug {
         // Configure the vcpu so that a KVM_DEBUG_EXIT would be generated
         // when encountering a software breakpoint during execution
@@ -355,9 +357,9 @@ pub fn build_microvm_for_boot(
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
     // and tests.
-    if vm_resources.boot_timer {
-        vmm::builder::attach_boot_timer_device(&mut vmm, request_ts)?;
-    }
+    // if vm_resources.boot_timer {
+    //     vmm::builder::attach_boot_timer_device(&mut vmm, request_ts)?;
+    // }
 
     vmm::builder::attach_block_devices(
         &mut vmm,
@@ -386,122 +388,105 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
-    // Move vcpus to their own threads and start their state machine in the 'Paused' state.
-    vmm.start_vcpus(
-        vcpus,
-        seccomp_filters
-            .get("vcpu")
-            .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
-            .clone(),
-    )
-    .map_err(VmmError::VcpuStart)
-    .map_err(Internal)?;
+    let mut vcpu = vcpus.into_iter().next().unwrap();
 
-    // Load seccomp filters for the VMM thread.
-    // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
-    // altogether is the desired behaviour.
-    // Keep this as the last step before resuming vcpus.
-    seccompiler::apply_filter(
-        seccomp_filters
-            .get("vmm")
-            .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
-    )
-    .map_err(VmmError::SeccompFilters)
-    .map_err(Internal)?;
+    // // Move vcpus to their own threads and start their state machine in the 'Paused' state.
+    // vmm.start_vcpus(
+    //     vcpus,
+    //     seccomp_filters
+    //         .get("vcpu")
+    //         .ok_or_else(|| MissingSeccompFilters("vcpu".to_string()))?
+    //         .clone(),
+    // )
+    // .map_err(VmmError::VcpuStart)
+    // .map_err(Internal)?;
+
+    // // Load seccomp filters for the VMM thread.
+    // // Execution panics if filters cannot be loaded, use --no-seccomp if skipping filters
+    // // altogether is the desired behaviour.
+    // // Keep this as the last step before resuming vcpus.
+    // seccompiler::apply_filter(
+    //     seccomp_filters
+    //         .get("vmm")
+    //         .ok_or_else(|| MissingSeccompFilters("vmm".to_string()))?,
+    // )
+    // .map_err(VmmError::SeccompFilters)
+    // .map_err(Internal)?;
 
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
 
-    Ok(vmm)
+    Ok((vmm, vcpu))
 }
 
-
-/// Builds and boots a microVM based on the current Firecracker VmResources configuration.
-///
-/// This is the default build recipe, one could build other microVM flavors by using the
-/// independent functions in this module instead of calling this recipe.
-///
-/// An `Arc` reference of the built `Vmm` is also plugged in the `EventManager`, while another
-/// is returned.
-pub fn build_and_boot_microvm(
-    instance_info: &InstanceInfo,
-    vm_resources: &VmResources,
-    event_manager: &mut EventManager,
-    seccomp_filters: &BpfThreadMap,
-) -> Result<Arc<Mutex<vmm::Vmm>>, StartMicrovmError> {
-    debug!("event_start: build microvm for boot");
-    let vmm = vmm::builder::build_microvm_for_boot(instance_info, vm_resources, event_manager, seccomp_filters)?;
-    debug!("event_end: build microvm for boot");
-    // The vcpus start off in the `Paused` state, let them run.
-    debug!("event_start: boot microvm");
-    vmm.lock()
-        .unwrap()
-        .resume_vm()
-        .map_err(StartMicrovmError::Internal)?;
-    debug!("event_end: boot microvm");
-    Ok(vmm)
-}
-
-// Configure and start a microVM as described by the command-line JSON.
-fn build_microvm_from_json(
-    seccomp_filters: &BpfThreadMap,
-    event_manager: &mut EventManager,
-    config_json: String,
-    instance_info: InstanceInfo,
-    boot_timer_enabled: bool,
-    mmds_size_limit: usize,
-    metadata_json: Option<&str>,
-) -> Result<(VmResources, Arc<Mutex<vmm::Vmm>>)> {
-    let mut vm_resources =
-        VmResources::from_json(&config_json, &instance_info, mmds_size_limit, metadata_json)?;
-    vm_resources.boot_timer = boot_timer_enabled;
-    let vmm = build_and_boot_microvm(
-        &instance_info,
-        &vm_resources,
-        event_manager,
-        seccomp_filters,
-    )?;
-    
-    info!("Successfully started microvm that was configured from one single json");
-
-    Ok((vm_resources, vmm))
+fn continue_vm(vcpu: &mut Vcpu) -> Result<()> {
+    println!("------------------------------------------------");
+    loop {
+        match vcpu.run_emulation()? {
+            // Emulation ran successfully, continue.
+            VcpuEmulation::Handled => (),
+            // Emulation was interrupted, check external events.
+            VcpuEmulation::Interrupted => 
+            // If the guest was rebooted or halted:
+            // - vCPU0 will always exit out of `KVM_RUN` with KVM_EXIT_SHUTDOWN or KVM_EXIT_HLT.
+            // - the other vCPUs won't ever exit out of `KVM_RUN`, but they won't consume CPU.
+            // So we pause vCPU0 and send a signal to the emulation thread to stop the VMM.
+            {println!("[STOP] interrupt"); return Ok(())},
+            VcpuEmulation::Stopped => 
+            {println!("[STOP] shutdown"); return Ok(())},
+            VcpuEmulation::PausedBreakpoint => 
+            {println!("[STOP] bp"); return Ok(())},
+        }
+    }
+    return Ok(())
 }
 
 fn run_without_api(
     seccomp_filters: &BpfThreadMap,
     config_json: Option<String>,
     instance_info: InstanceInfo,
-    bool_timer_enabled: bool,
+    boot_timer_enabled: bool,
     mmds_size_limit: usize,
 ) -> Result<()> {
     let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
     // Build the microVm. We can ignore VmResources since it's not used without api.
-    let (_, vmm) = build_microvm_from_json(
-        seccomp_filters,
-        &mut event_manager,
-        config_json.expect("expected --config-file"),
-        instance_info,
-        bool_timer_enabled,
-        mmds_size_limit,
-        None,
-    )?;
+    let mut vm_resources =
+        VmResources::from_json(&config_json.expect("no config given"), &instance_info, mmds_size_limit, None)?;
 
+    vm_resources.boot_timer = boot_timer_enabled;
 
-    // Run the EventManager that drives everything in the microVM.
-    loop {
-        event_manager
-            .run()
-            .expect("Failed to start the event manager");
-        match vmm.lock().unwrap().shutdown_exit_code() {
-            Some(FcExitCode::Ok) => break,
-            Some(exit_code) => return Err(anyhow::anyhow!("Shutting down with exit code: {:?}", exit_code)),
-            None => continue,
+    debug!("event_start: build microvm for boot");
+
+    let (vmm, mut vcpu) = build_microvm_for_boot(&instance_info, &vm_resources, &mut event_manager, seccomp_filters)?;
+    debug!("event_end: build microvm for boot");
+
+    vcpu.set_mmio_bus(vmm.lock().unwrap().mmio_device_manager.bus.clone());
+    #[cfg(target_arch = "x86_64")]
+    vcpu.kvm_vcpu
+        .set_pio_bus(vmm.lock().unwrap().pio_device_manager.io_bus.clone());
+
+    use std::thread;
+    thread::spawn(move || 
+        loop {
+            continue_vm(&mut vcpu);
         }
-        //use std::time::Duration;
-        //println!("wait for breakpoint");
-        //vmm.lock().unwrap().wait_for_hypercall(Duration::from_millis(10)).expect("was waiting for hypercall, wtf?");
-        //println!("wait for breakpoint");
-    }
+    );
+        loop {event_manager.run(); }
+    // Run the EventManager that drives everything in the microVM.
+    // loop {
+    //     event_manager
+    //         .run()
+    //         .expect("Failed to start the event manager");
+    //     match vmm.lock().unwrap().shutdown_exit_code() {
+    //         Some(FcExitCode::Ok) => break,
+    //         Some(exit_code) => return Err(anyhow::anyhow!("Shutting down with exit code: {:?}", exit_code)),
+    //         None => continue,
+    //     }
+    //     //use std::time::Duration;
+    //     //println!("wait for breakpoint");
+    //     //vmm.lock().unwrap().wait_for_hypercall(Duration::from_millis(10)).expect("was waiting for hypercall, wtf?");
+    //     //println!("wait for breakpoint");
+    // }
     Ok(())
 }
