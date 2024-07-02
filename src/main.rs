@@ -7,7 +7,7 @@ extern crate anyhow;
 extern crate kvm_ioctls;
 extern crate kvm_bindings;
 
-use std::fs::{self, File};
+use std::fs::{self};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -24,27 +24,22 @@ use utils::validators::validate_instance_id;
 use utils::time::TimestampUs;
 use vmm::builder::StartMicrovmError;
 use vmm::logger::{
-    debug, error, info, LoggerConfig, ProcessTimeReporter, StoreMetric, LOGGER,
+    debug, error, info, LoggerConfig, LOGGER,
 };
-use vmm::persist::SNAPSHOT_VERSION;
 use vmm::resources::VmResources;
 use vmm::signal_handler::register_signal_handlers;
-use vmm::snapshot::{Snapshot, SnapshotError};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vmm_config::metrics::{init_metrics, MetricsConfig, MetricsConfigError};
-use vmm::{EventManager, FcExitCode, HTTP_MAX_PAYLOAD_SIZE};
-use vmm::VmmError;
+use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
+use vmm::{EventManager};
 use vmm::vstate::memory::GuestMemoryMmap;
 use vmm::Vmm;
 use vmm::Vcpu;
-use vmm::resources;
 use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::cpu_config::templates::GetCpuTemplate;
 use vmm::vstate::vcpu::VcpuEmulation;
 
-use kvm_ioctls::Kvm;
 use kvm_bindings::{
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug_arch, kvm_guest_debug
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug
 };
 
 fn main() -> ExitCode {
@@ -193,7 +188,7 @@ fn main_exec() -> Result<()> {
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
-    let mut seccomp_filters: BpfThreadMap = vmm::seccomp_filters::get_empty_filters();
+    let seccomp_filters: BpfThreadMap = vmm::seccomp_filters::get_empty_filters();
 
     let mmds_size_limit = 0;
     let boot_timer_enabled = false;
@@ -388,7 +383,7 @@ pub fn build_microvm_for_boot(
         boot_cmdline,
     )?;
 
-    let mut vcpu = vcpus.into_iter().next().unwrap();
+    let vcpu = vcpus.into_iter().next().unwrap();
 
     // // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     // vmm.start_vcpus(
