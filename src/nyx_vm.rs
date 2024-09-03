@@ -1,28 +1,24 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
-use std::{io, panic, thread};
+use std::{thread};
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 
-use std::io::Write;
 use vmm::logger::debug;
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo};
+use vmm::persist::{MicrovmState};
 use vmm::resources::VmResources;
-use vmm::signal_handler::register_signal_handlers;
-use vmm::snapshot::{Persist, Snapshot};
+use vmm::snapshot::{Persist};
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
-use vmm::{EventManager, FcExitCode, VcpuEvent, VcpuHandle};
-use vmm::vstate::memory::{AtomicBitmap, Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
+use vmm::{EventManager, FcExitCode, VcpuEvent};
+use vmm::vstate::memory::{Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 use vmm::Vmm;
 use vmm::Vcpu;
 use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::vstate::vcpu::VcpuEmulation;
 
 use kvm_bindings::{
-    kvm_guest_debug, kvm_regs, kvm_sregs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP
+    kvm_regs, kvm_sregs
 };
 
 use crate::firecracker_wrappers::build_microvm_for_boot;
@@ -270,8 +266,8 @@ impl NyxVM{
     pub fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> u64 {
         let vmm = &self.vmm.lock().unwrap();
         let mem = vmm.guest_memory();
-        let paddr = mem::resolve_addr(mem, cr3, vaddr);
-        return mem::read_phys_u64(mem, paddr);
+        let paddr = mem::resolve_addr(mem, cr3, vaddr).unwrap();
+        return mem::read_phys_u64(mem, paddr).unwrap();
     }
 
     pub fn write_current_u64(&self, vaddr: u64, val: u64) {
@@ -281,7 +277,7 @@ impl NyxVM{
     pub fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) {
         let vmm = &self.vmm.lock().unwrap();
         let mem = vmm.guest_memory();
-        let paddr = mem::resolve_addr(mem, cr3, vaddr);
+        let paddr = mem::resolve_addr(mem, cr3, vaddr).unwrap();
         vmm.guest_memory().store(val, GuestAddress(paddr), Ordering::Relaxed).unwrap();
     }
 }

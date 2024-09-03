@@ -11,45 +11,20 @@ use std::fs::{self};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use std::{io, panic, thread};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::{io};
 
 use anyhow::Result;
 
-use event_manager::SubscriberOps;
-use kvm_ioctls::MsrExitReason;
 use nyx_lite::{ExitReason, NyxVM};
 use nyx_lite::firecracker_wrappers::{resize_fdtable, ResizeFdTableError};
-use seccompiler::BpfThreadMap;
 use utils::arg_parser::{ArgParser, Argument};
-use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
-use utils::time::TimestampUs;
-use vmm::builder::StartMicrovmError;
-use vmm::devices::BusDevice;
 use vmm::logger::{
     debug, error, info, LoggerConfig, LOGGER,
 };
-use vmm::persist::{MicrovmState, MicrovmStateError, VmInfo};
-use vmm::resources::VmResources;
 use vmm::signal_handler::register_signal_handlers;
-use vmm::snapshot::Persist;
-use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
 use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
-use vmm::{EventManager, FcExitCode, VcpuEvent, VcpuHandle};
-use vmm::vstate::memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
-use vmm::Vmm;
-use vmm::Vcpu;
-use vmm::vstate::memory::GuestMemoryExtension;
-use vmm::cpu_config::templates::GetCpuTemplate;
-use vmm::vstate::vcpu::VcpuEmulation;
 
-use kvm_bindings::{
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug
-};
 
 fn main() -> ExitCode {
     let result = main_exec();
