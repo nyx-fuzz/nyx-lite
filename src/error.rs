@@ -22,6 +22,4 @@ pub enum MemoryError {
     CantAccessPhysicalPage(GuestAddress),
     #[error("page at page_table p:{:x}:{} is not present", (.0).0 ,.1)]
     PageNotPresent(GuestAddress, u64),
-    #[error("no page mapped at {0:x}")]
-    PageNotMapped(u64)
 }

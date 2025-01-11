@@ -570,6 +570,7 @@ dependencies = [
  "seccompiler",
  "thiserror",
  "utils",
+ "vm-memory",
  "vmm",
 ]
 

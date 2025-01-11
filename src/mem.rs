@@ -1,8 +1,9 @@
 use core::fmt;
-use std::{iter::Peekable, marker::PhantomData, ops::{Range, RangeBounds}, sync::atomic::Ordering};
+use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
-use vmm::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
-
+use vmm::vstate::memory::{Address, AtomicBitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap, MemoryRegionAddress};
+use vm_memory::{GuestUsize, VolatileSlice};
+use vm_memory::bitmap::{Bitmap, BS, MS};
 use crate::error::MemoryError;
 
 
@@ -253,6 +254,56 @@ impl<'mem, BaseIter: Iterator<Item=PTE>> Iterator for MergedPTEWalker<'mem, Base
         }
         return Some(cur);
     }
+}
+
+
+pub struct VirtMappedRange{
+    cr3: u64,
+    start: u64,
+    end: u64,
+    tlb: Vec<GuestAddress>
+}
+
+impl VirtMappedRange{
+    pub fn new(cr3: u64, start:u64, end:u64) -> Self{
+        assert!(end >= start);
+        assert!(start & M_PAGE_OFFSET == 0);
+        assert!(end & M_PAGE_OFFSET == 0);
+        Self{cr3, start, end, tlb: vec![]}
+    }
+
+    pub fn validate(&mut self, mem: &GuestMemoryMmap) -> Result<(), MemoryError> {
+        self.tlb.reserve(((self.end-self.start) / PAGE_SIZE).try_into().unwrap());
+        self.tlb.clear();
+        for pte in walk_virtual_pages(mem, self.cr3, self.start & M_PAGE_OFFSET, self.end & M_PAGE_OFFSET){
+            if !pte.present() {
+                return Err(MemoryError::PageNotPresent(pte.phys_addr(), pte.vaddrs.start));
+            }
+            if !pte.missing_page() {
+                return Err(MemoryError::CantAccessPhysicalPage(pte.phys_addr()));
+            }
+            self.tlb.push(pte.phys_addr());
+        }
+        return Ok(())
+    }
+
+    pub fn iter<'mem>(&'mem mut self, mem: &'mem GuestMemoryMmap) -> 
+        impl Iterator<Item = (u64, VolatileSlice<'mem, BS<<GuestRegionMmap as GuestMemoryRegion>::B>>) > + 'mem {
+        self.tlb.iter().enumerate().map(|(i, guest_phys_addr)| {
+        if let Some(region) = mem.find_region(*guest_phys_addr) {
+           let start = region.to_region_addr(*guest_phys_addr).unwrap();
+           let cap = region.len() - start.raw_value();
+           let len = std::cmp::min(cap, PAGE_SIZE as GuestUsize);
+           assert_eq!(len, PAGE_SIZE as GuestUsize);
+           let volatile_slice = region.as_volatile_slice().unwrap();
+           return (self.start+(i as u64)*PAGE_SIZE, volatile_slice)
+        }
+        panic!("couldn't access memory for cr3: {:x}, addr: {:x} - region for physical {:x} not found ", 
+        self.cr3, 
+        self.start + (i as u64) * PAGE_SIZE, 
+        guest_phys_addr.raw_value());
+    })
+}
 }
 
 #[cfg(test)]

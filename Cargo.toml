@@ -16,6 +16,7 @@ thiserror="1.0.61"
 displaydoc = "0.2.5"
 kvm-bindings = { version = "0.8.0", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = "0.17.0"
+vm-memory = "0.14.1"
 
 [lib]
 name = "nyx_lite"
