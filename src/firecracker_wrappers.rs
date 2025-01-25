@@ -5,18 +5,16 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use vmm::builder::StartMicrovmError;
-use vmm::resources::VmResources;
-use vmm::vmm_config::instance_info::{InstanceInfo};
-use vmm::{EventManager, VcpuHandle};
-use vmm::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
-use vmm::Vmm;
-use vmm::Vcpu;
-use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::cpu_config::templates::GetCpuTemplate;
+use vmm::resources::VmResources;
+use vmm::vmm_config::instance_info::InstanceInfo;
+use vmm::vstate::memory::GuestMemoryExtension;
+use vmm::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vmm::Vcpu;
+use vmm::Vmm;
+use vmm::{EventManager, VcpuHandle};
 
-use kvm_bindings::{
-    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP, kvm_guest_debug
-};
+use kvm_bindings::{kvm_guest_debug, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_USE_SW_BP};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResizeFdTableError {
@@ -27,7 +25,6 @@ pub enum ResizeFdTableError {
     /// Failed to close dup2'd file descriptor
     Close(io::Error),
 }
-
 
 /// Attempts to resize the processes file descriptor table to match RLIMIT_NOFILE or 2048 if no
 /// RLIMIT_NOFILE is set (this can only happen if firecracker is run outside the jailer. 2048 is
@@ -76,8 +73,6 @@ pub fn resize_fdtable() -> Result<(), ResizeFdTableError> {
 
     Ok(())
 }
-
-
 
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 ///
@@ -157,17 +152,15 @@ pub fn build_microvm_for_boot(
         // Reset all arch-specific debug registers
         arch: Default::default(),
     };
-    
+
     vcpus[0].kvm_vcpu.fd.set_guest_debug(&debug_struct).unwrap();
     /// END NYX-LITE PATCH
-
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
     // and tests.
     // if vm_resources.boot_timer {
     //     vmm::builder::attach_boot_timer_device(&mut vmm, request_ts)?;
     // }
-
     vmm::builder::attach_block_devices(
         &mut vmm,
         &mut boot_cmdline,
@@ -199,12 +192,10 @@ pub fn build_microvm_for_boot(
     let event_sender = vcpu.event_sender.take().expect("vCPU already started");
     let response_receiver = vcpu.response_receiver.take().unwrap();
     let vcpu_join_handle = thread::Builder::new()
-    .name(format!("fake vcpu thread")).spawn(||{}).unwrap();
-    let handle = VcpuHandle::new(
-        event_sender,
-        response_receiver,
-        vcpu_join_handle,
-    );
+        .name(format!("fake vcpu thread"))
+        .spawn(|| {})
+        .unwrap();
+    let handle = VcpuHandle::new(event_sender, response_receiver, vcpu_join_handle);
 
     //END NYX-LITE PATCH
     vmm.vcpus_handles.push(handle);
@@ -212,6 +203,7 @@ pub fn build_microvm_for_boot(
     event_manager.add_subscriber(vmm.clone());
 
     vcpu.set_mmio_bus(vmm.lock().unwrap().mmio_device_manager.bus.clone());
-    vcpu.kvm_vcpu.set_pio_bus(vmm.lock().unwrap().pio_device_manager.io_bus.clone());
+    vcpu.kvm_vcpu
+        .set_pio_bus(vmm.lock().unwrap().pio_device_manager.io_bus.clone());
     Ok((vmm, vcpu))
 }

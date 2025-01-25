@@ -1,0 +1,32 @@
+Caught these error messages:
+1)
+[    2.301987] virtio_blk virtio0: req.0:id 141 is not a head!
+[    2.302689] I/O error, dev vda, sector 267616 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2
+[    2.303642] I/O error, dev vda, sector 267616 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2
+
+2)
+thread 'event_thread' panicked at /firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:517:17:
+The number of available virtio descriptors is greater than queue size!
+
+3)
+[   69.873721] virtio_blk virtio0: req.0:id 114 is not a head!
+[   69.874651] I/O error, dev vda, sector 4584 op 0x1:(WRITE) flags 0x103000 phys_seg 1 prio class 2
+[   69.875509] Buffer I/O error on dev vda, logical block 573, lost async page write
+[   69.876183] I/O error, dev vda, sector 992 op 0x1:(WRITE) flags 0x103000 phys_seg 1 prio class 2
+[   69.877011] Buffer I/O error on dev vda, logical block 124, lost async page write
+[   69.877822] I/O error, dev vda, sector 0 op 0x1:(WRITE) flags 0x103000 phys_seg 1 prio class 2
+[   69.878689] Buffer I/O error on dev vda, logical block 0, lost async page write
+[   69.879418] I/O error, dev vda, sector 557064 op 0x1:(WRITE) flags 0x0 phys_seg 1 prio class 2
+[   69.880274] EXT4-fs warning (device vda): ext4_end_bio:343: I/O error 10 writing to inode 2950 starting block 69633)
+[   69.881332] I/O error, dev vda, sector 557056 op 0x1:(WRITE) flags 0x4000 phys_seg 1 prio class 2
+[   69.882203] EXT4-fs warning (device vda): ext4_end_bio:343: I/O error 10 writing to inode 236 starting block 69632)
+[   69.883227] I/O error, dev vda, sector 28376 op 0x1:(WRITE) flags 0x103000 phys_seg 1 prio class 2
+[   69.884109] Buffer I/O error on dev vda, logical block 3547, lost async page write
+[   69.884857] EXT4-fs error (device vda): ext4_check_bdev_write_error:217: comm kworker/u2:0: Error while async write back metadata
+[   69.885988] EXT4-fs (vda): previous I/O error to superblock detected
+[   69.886637] I/O error, dev vda, sector 524448 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 2
+[   69.887572] I/O error, dev vda, sector 524440 op 0x1:(WRITE) flags 0x4800 phys_seg 1 prio class 2
+[   69.888452] I/O error, dev vda, sector 524432 op 0x1:(WRITE) flags 0x4800 phys_seg 1 prio class 2
+[   69.889342] I/O error, dev vda, sector 524424 op 0x1:(WRITE) flags 0x4800 phys_seg 1 prio class 2
+[   69.890240] Buffer I/O error on device vda, logical block 69633
+[   69.890840] Buffer I/O error on device vda, logical block 69632

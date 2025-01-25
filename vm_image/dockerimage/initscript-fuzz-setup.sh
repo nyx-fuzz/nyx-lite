@@ -28,6 +28,8 @@ start() {
   #start sshd
   #rc-service sshd start
   /resources/test_swbp
-  reboot
+  echo "ABOUT TO SHUT DOWN VIA SHELL!"
+  reboot -f 
+  echo "STILL RUNNING???"
 	return 0
 }

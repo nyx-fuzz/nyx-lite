@@ -1,5 +1,7 @@
 vm_image/vmlinux-6.1.58
 vm_image/dockerimage/rootfs.ext4
+vm_image/dockerimage/resources/
+examples/test_*
 
 
 # Added by cargo

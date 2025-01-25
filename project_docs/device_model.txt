@@ -1,0 +1,41 @@
+* virtio
+  * ballon
+  * block
+  * gen
+  * net
+  * rng
+  * vsock
+* pseudo
+  * boot_timer
+  * bus_read/write
+* legacy
+  * i8042
+    - Fake PS/2 controller to handle shutdown commands.
+    - reset_evt: EventFD (CPU reset eventfd. Will set this even when the guest issues CMD_RESET_CPU)
+      * this event doesn't seem to be delivered after a snapshot reset?
+    - kbd_interrupt_evt: EventFD (IRQ 1)
+    - bus_read/write(offset, data)
+    - no EventSubscriber?
+  * rtc_pl031
+    - a clock, but device just seems to wrtap vm_superio's device emulation
+    - bus_read/write
+  * serial
+    - alias for SerialWrapper
+    - EventSubscriber
+      - serial_input_fd (In) (registers events on stdin)
+      - buf_ready_evt_fd (In)
+    - bus_read/write
+    - BusDevice (enum of all devices) somehow implements EventSubscriber by forwarding to serial only
+* acpi
+  * vmgenid: VMGenID exposes a 128-bit cryptographically integer: https://go.microsoft.com/fwlink/?LinkId=260709
+
+There's a device manager for some type of devices (virtio/legacy/acpi) except for 
+* device managers for virtio,legacy(PortIODeviceManager) have their own buses
+* acpi device manager does not (only vmgenid, no need for bus, only calls device during snapshot restore, apparently.)
+
+KvmVcpu has Peripherals, which has pio_bus and mmio_bus:
+`handle_kvm_exit()` in Vcpu matches MMIO read/write and forwards to peripherals.mmio_bus
+`handle_kvm_exit()` also calls peripherals.run_arch_emulation for IoIn/IoOut exit reasons (which calls read/write on
+peripherals.pio_bus)
+BusDevice(BootTimer) forwards to BootTimer, boot_timer is attached to vmm.mmio_device_manager during `build_microvm_for_boot`
+for each virtio device (block and network), we attach the device to the event_manager

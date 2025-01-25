@@ -1,30 +1,27 @@
-extern crate vmm;
-extern crate utils;
+extern crate anyhow;
 extern crate event_manager;
+extern crate kvm_bindings;
+extern crate kvm_ioctls;
 extern crate libc;
 extern crate thiserror;
-extern crate anyhow;
-extern crate kvm_ioctls;
-extern crate kvm_bindings;
+extern crate utils;
+extern crate vmm;
 
 use std::fs::{self};
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::{io};
 
 use anyhow::Result;
 
-use nyx_lite::{ExitReason, NyxVM};
 use nyx_lite::firecracker_wrappers::{resize_fdtable, ResizeFdTableError};
+use nyx_lite::{ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
 use utils::validators::validate_instance_id;
-use vmm::logger::{
-    debug, error, info, LoggerConfig, LOGGER,
-};
+use vmm::logger::{debug, error, info, LoggerConfig, LOGGER};
 use vmm::signal_handler::register_signal_handlers;
 use vmm::vmm_config::metrics::{init_metrics, MetricsConfig};
-
 
 fn main() -> ExitCode {
     let result = main_exec();
@@ -96,6 +93,11 @@ fn main_exec() -> Result<()> {
                 Argument::new("metrics-path")
                     .takes_value(true)
                     .help("Path to a fifo or a file used for configuring the metrics on startup."),
+            )
+            .arg(
+                Argument::new("snapshot")
+                    .takes_value(false)
+                    .help("whether to rest a few times"),
             );
 
     arg_parser.parse_from_cmdline()?;
@@ -123,14 +125,13 @@ fn main_exec() -> Result<()> {
     let show_level = arguments.flag_present("show-level").then_some(true);
     let show_log_origin = arguments.flag_present("show-log-origin").then_some(true);
     let module = arguments.single_value("module").cloned();
-    LOGGER
-        .update(LoggerConfig {
-            log_path,
-            level,
-            show_level,
-            show_log_origin,
-            module,
-        })?;
+    LOGGER.update(LoggerConfig {
+        log_path,
+        level,
+        show_level,
+        show_log_origin,
+        module,
+    })?;
     info!("Running NYX-lite");
 
     register_signal_handlers()?;
@@ -144,7 +145,7 @@ fn main_exec() -> Result<()> {
             }
             // This error means that we now have a random file descriptor lying around, abort to be
             // cautious.
-            ResizeFdTableError::Close(_) => Err(err)?
+            ResizeFdTableError::Close(_) => Err(err)?,
         }
     }
 
@@ -169,32 +170,40 @@ fn main_exec() -> Result<()> {
         let exit_reason = vm.run();
         match exit_reason {
             ExitReason::Hypercall(num, arg1, arg2, arg3) => {
-                println!("got hypercall {}({:x}, {:x} {:x})", num, arg1, arg2, arg3);
-            },
+                println!("got hypercall {:x}({:x}, {:x} {:x})", num, arg1, arg2, arg3);
+            }
             ExitReason::RequestSnapshot => {
                 snap = Some(vm.take_snapshot());
-            },
+                //if arguments.flag_present("snapshot")  {
+                //    vm.apply_snapshot(snap.as_ref().unwrap());
+                //}
+            }
             ExitReason::ExecDone(exit_code) => {
-                if apply_count < 1000 {
+                if arguments.flag_present("snapshot") && apply_count < 100 {
                     println!(">>> RESTORE SNAPSHOT");
                     vm.apply_snapshot(snap.as_ref().unwrap());
-                    vm.write_current_u64(addr, 0xabcdef12_34567890+apply_count);
+                    vm.write_current_u64(addr, 0xabcdef12_34567890 + apply_count);
                     apply_count += 1;
+                } else {
+                    println!(">>> NO RESTORE - JUST CONTINUE");
                 }
-            },
-            ExitReason::SharedMem(name, saddr, size ) => {
-                println!("Request to share memory {} at {:x} with size {}", name, addr, size);
-                println!("Found: {:x}", vm.read_current_u64(addr));
+            }
+            ExitReason::SharedMem(name, saddr, size) => {
+                println!(
+                    "Request to share memory {} at {:x} with size {}",
+                    name, saddr, size
+                );
+                println!("Found: {:x}", vm.read_current_u64(saddr));
                 addr = saddr;
-            },
+            }
             ExitReason::Shutdown => {
+                println!(">>> HYPERCALL SHUTDOWN");
                 break;
-            },
+            }
             e => {
-                println!("unhandled exit reason {:?}", e);
+                println!(">>> unhandled exit reason {:?}", e);
             }
         }
     }
-    return Ok(())
-
+    return Ok(());
 }
