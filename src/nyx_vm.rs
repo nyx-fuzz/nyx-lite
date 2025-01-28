@@ -33,7 +33,7 @@ use vmm::{EventManager, FcExitCode, VcpuEvent};
 use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs};
 
 use crate::firecracker_wrappers::build_microvm_for_boot;
-use crate::mem;
+use crate::mem::{self, walk_virtual_pages, M_PAGE_ALIGN, M_PAGE_OFFSET, PAGE_SIZE};
 
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
@@ -383,7 +383,7 @@ impl NyxVM {
                                 let r15 = regs.r15;
                                 //println!("r8: {r8:x}, r9: {r9:x}, r10: {r10:x}, r11: {r11:x}, r12: {r12:x}, r13: {r13:x}, r14: {r14:x}, r15: {r15:x}");
                                 ExitReason::SharedMem(
-                                    self.read_cstr_current(regs.r9),
+                                    String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
                                     r10,
                                     r11.try_into().unwrap(),
                                 )
@@ -414,8 +414,30 @@ impl NyxVM {
         }
     }
 
-    pub fn read_cstr_current(&self, guest_addr: u64) -> String {
-        return format!("FAKE {guest_addr:x}");
+    pub fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>{
+        let vmm = &self.vmm.lock().unwrap();
+        let mem = vmm.guest_memory();
+        let mut res = Vec::new();
+        let mut cur_addr = guest_vaddr;
+        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
+            if !pte.present() || pte.missing_page() {
+                return res;
+            }
+            let slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
+            while cur_addr < pte.vaddrs.end {
+                let u8_char = slice.load::<u8>((cur_addr&M_PAGE_OFFSET) as usize, Ordering::Relaxed).unwrap();
+                res.push(u8_char);
+                cur_addr += 1;
+                if u8_char == 0 {
+                    return res;
+                }
+            }
+        }
+        return res;
+    }
+    pub fn read_cstr_current(&self, guest_vaddr: u64) -> Vec<u8> {
+        let cr3 = self.sregs().cr3;
+        self.read_virtual_cstr(cr3, guest_vaddr)
     }
 
     pub fn read_current_u64(&self, vaddr: u64) -> u64 {

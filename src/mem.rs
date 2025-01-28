@@ -172,7 +172,7 @@ impl<'mem> PTEWalker<'mem> {
         Self {
             mem,
             offsets: [l1, l2, l3, l4],
-            bases: [cr3, 0, 0, 0],
+            bases: [cr3 & M_PAGE_ALIGN, 0, 0, 0],
             level: 0,
             last_page,
         }
@@ -277,9 +277,7 @@ impl<'mem, BaseIter: Iterator<Item = PTE>> Iterator for MergedPTEWalker<'mem, Ba
     fn next(&mut self) -> Option<Self::Item> {
         let mut cur = self.inner.next()?;
         while let Some(next) = self.inner.peek() {
-            println!("merging cur {:?} with {:?}", cur, next);
             if !cur.merge_with(next) {
-                println!("couldn't merge, break");
                 break;
             }
             self.inner.next();
