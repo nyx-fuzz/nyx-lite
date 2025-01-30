@@ -12,6 +12,8 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::thread::sleep;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -166,24 +168,25 @@ fn main_exec() -> Result<()> {
     let mut apply_count = 0;
     let mut addr = 0;
     loop {
-        //println!("-------------------[test]-----------------------------");
-        let exit_reason = vm.run();
+        let timeout = Duration::from_secs(2);
+        let exit_reason = vm.run(timeout);
         match exit_reason {
+            ExitReason::Timeout => {
+                println!("execution timed out");
+            }
             ExitReason::Hypercall(num, arg1, arg2, arg3) => {
                 println!("got hypercall {:x}({:x}, {:x} {:x})", num, arg1, arg2, arg3);
             }
             ExitReason::RequestSnapshot => {
                 snap = Some(vm.take_snapshot());
-                //if arguments.flag_present("snapshot")  {
-                //    vm.apply_snapshot(snap.as_ref().unwrap());
-                //}
             }
             ExitReason::ExecDone(exit_code) => {
                 if arguments.flag_present("snapshot") && apply_count < 100 {
+                    apply_count += 1;
                     println!(">>> RESTORE SNAPSHOT");
                     vm.apply_snapshot(snap.as_ref().unwrap());
+                    // update shared memory
                     vm.write_current_u64(addr, 0xabcdef12_34567890 + apply_count);
-                    apply_count += 1;
                 } else {
                     println!(">>> NO RESTORE - JUST CONTINUE");
                 }

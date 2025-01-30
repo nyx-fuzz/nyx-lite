@@ -2,6 +2,7 @@ use std::arch::asm;
 use std::ffi::CString;
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
@@ -77,6 +78,11 @@ fn main() -> ExitCode {
         shared[0]
     );
     let _ = std::io::stdout().flush();
+    if shared[0] > 0x95 {
+        println!( "***TEST TARGET***: Going to Sleep for 100 seconds - test timeout",);
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(Duration::from_secs(100));
+    }
     shared[0] = 0x41;
     shared[1] = 0x42;
     shared[2] = 0x43;

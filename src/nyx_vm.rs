@@ -2,10 +2,12 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{self, Duration};
 use std::{io, thread};
 
 use anyhow::Result;
 
+use event_manager::SubscriberOps;
 use vmm::arch::DeviceType;
 use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
 use vmm::device_manager::legacy::PortIODeviceManager;
@@ -34,6 +36,7 @@ use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs};
 
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::mem::{self, walk_virtual_pages, M_PAGE_ALIGN, M_PAGE_OFFSET, PAGE_SIZE};
+use crate::timer_event::TimerEvent;
 
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
@@ -45,6 +48,7 @@ pub struct NyxVM {
     event_thread_handle: JoinHandle<Result<(), anyhow::Error>>,
     vm_resources: VmResources,
     block_devices: Vec<Arc<Mutex<Block>>>,
+    timeout_timer: Arc<Mutex<TimerEvent>>,
 }
 
 pub struct BlockDeviceSnapshot {
@@ -90,6 +94,9 @@ pub enum ExitReason {
 }
 
 impl NyxVM {
+    // NOTE: due to the fact that timeout timers are tied to the thread that
+    // makes the NyxVM (see TimerEvent for more details), it's probably unsafe
+    // to use a NyxVM in a different thread than the one that made it.
     pub fn new(instance_id: String, config_json: &str) -> Self {
         let mmds_size_limit = 0;
 
@@ -123,21 +130,11 @@ impl NyxVM {
         let (vmm, vcpu) = build_microvm_for_boot(&instance_info, &vm_resources, &mut event_manager)
             .expect("couldn't prepare vm");
         debug!("event_end: build microvm for boot");
-
-        // use std::thread;
-        // let t_vmm = Arc::clone(&vmm);
-        // let t = thread::spawn(move ||
-        //     loop {
-        //         if !continue_vm(&mut vcpu).unwrap(){
-        //             break;
-        //         }
-        //         let vm_info = vmm::persist::VmInfo::from(&vm_resources);
-        //         println!("saving");
-        //         let (mem,state) = save_state(&mut t_vmm.lock().unwrap(), &vcpu, &vm_info).unwrap();
-        //         restore_state(&mut t_vmm.lock().unwrap(), &mut vcpu, &state, &mem);
-        //         println!("done saving");
-        //     }
-        // );
+        
+        let timeout_timer = Arc::new(Mutex::new(TimerEvent::new()));
+        event_manager.add_subscriber(timeout_timer.clone());
+	// This will allow the timeout timer to send the signal that makes KVM exit immediatly
+        Vcpu::register_kick_signal_handler();
         let t_vmm = Arc::clone(&vmm);
         let event_thread_handle = thread::Builder::new()
             .name("event_thread".to_string())
@@ -164,6 +161,7 @@ impl NyxVM {
             vm_resources,
             event_thread_handle,
             block_devices,
+            timeout_timer,
         };
     }
 
@@ -352,7 +350,9 @@ impl NyxVM {
         self.vcpu.kvm_vcpu.fd.set_regs(regs).unwrap();
     }
 
-    pub fn run(&mut self) -> ExitReason {
+    pub fn run(&mut self, timeout: Duration) -> ExitReason {
+        let start_time = time::Instant::now();
+        self.timeout_timer.lock().unwrap().set_timeout(timeout);
         loop {
             let mut exit = None;
             match self.vcpu.run_emulation().unwrap() {
@@ -360,8 +360,12 @@ impl NyxVM {
                 VcpuEmulation::Handled => {}
                 // Emulation was interrupted, check external events.
                 VcpuEmulation::Interrupted => {
-                    //println!("[STOP] interrupt");
-                    exit = Some(ExitReason::Interrupted);
+                    if time::Instant::now().duration_since(start_time) >= timeout {
+                        exit = Some(ExitReason::Timeout);
+                    } else {
+                        println!("[STOP] interrupt");
+                        exit = Some(ExitReason::Interrupted);
+                    }
                 }
                 VcpuEmulation::Stopped => {
                     //println!("[STOP] shutdown");
@@ -409,6 +413,7 @@ impl NyxVM {
                 }
             }
             if let Some(exitreason) = exit {
+                self.timeout_timer.lock().unwrap().disable();
                 return exitreason;
             }
         }

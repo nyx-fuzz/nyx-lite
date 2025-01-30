@@ -569,6 +569,7 @@ dependencies = [
  "libc",
  "seccompiler",
  "thiserror",
+ "timerfd",
  "utils",
  "vm-memory",
  "vmm",

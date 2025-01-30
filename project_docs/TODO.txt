@@ -6,7 +6,6 @@ PRE RELEASE:
   * Add testing
 * incremental snapshots
 * snapshot tree api
-* timeout on execution
 * api to load dockerfiles directly
 * api to load a rootdir based fs directly
 * E2E testing setup
@@ -15,7 +14,6 @@ PRE RELEASE:
   * cleaning up lint errors
   * comments on the actual api
 
-* harddisk snapshots & isolation
 * root snapshot sharing between processes
 * profiling snapshot performance
 * breakpoints

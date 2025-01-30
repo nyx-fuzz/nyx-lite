@@ -18,6 +18,8 @@ kvm-bindings = { version = "0.8.0", features = ["fam-wrappers", "serde"] }
 kvm-ioctls = "0.17.0"
 vm-memory = "0.14.1"
 
+timerfd ="1.6.0"
+
 [lib]
 name = "nyx_lite"
 path = "src/lib.rs"
