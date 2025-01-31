@@ -28,5 +28,9 @@ path = "src/lib.rs"
 name = "nyx_lite_main"
 path = "src/main.rs"
 
+[[bin]]
+name = "e2e_test"
+path = "src/e2e_test_main.rs"
+
 [profile.release]
 debug = true

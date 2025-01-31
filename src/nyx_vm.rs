@@ -1,23 +1,21 @@
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{self, Duration};
-use std::{io, thread};
+use std::thread;
 
 use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use vmm::arch::DeviceType;
 use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
-use vmm::device_manager::legacy::PortIODeviceManager;
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
 use vmm::devices::virtio::block::virtio::persist::VirtioBlockState;
 use vmm::devices::virtio::device::VirtioDevice;
 use vmm::devices::virtio::queue::Queue;
-use vmm::devices::virtio::{AsAny, TYPE_BLOCK};
+use vmm::devices::virtio::TYPE_BLOCK;
 use vmm::logger::debug;
 use vmm::persist::MicrovmState;
 use vmm::resources::VmResources;
@@ -83,7 +81,7 @@ pub struct BaseSnapshot {
 #[derive(Debug)]
 pub enum ExitReason {
     Shutdown,
-    Hypercall(u64, u64, u64, u64),
+    Hypercall(u64, u64, u64, u64, u64),
     RequestSnapshot,
     ExecDone(u64),
     SharedMem(String, u64, usize),
@@ -140,7 +138,7 @@ impl NyxVM {
             .name("event_thread".to_string())
             .spawn(move || {
                 loop {
-                    let cnt = event_manager.run_with_timeout(500).unwrap();
+                    let _cnt = event_manager.run_with_timeout(500).unwrap();
                     match t_vmm.lock().unwrap().shutdown_exit_code() {
                         Some(FcExitCode::Ok) => break,
                         Some(exit_code) => {
@@ -251,7 +249,7 @@ impl NyxVM {
                 for (queue, queue_snap) in
                     locked_dev.queues_mut().iter_mut().zip(vstate.queues.iter())
                 {
-                    let mut new_queue = Queue::restore((), queue_snap).unwrap();
+                    let new_queue = Queue::restore((), queue_snap).unwrap();
                     let _ = std::mem::replace(queue, new_queue);
                 }
             } else {
@@ -377,14 +375,14 @@ impl NyxVM {
                     if regs.rax == NYX_LITE {
                         let hypercall = match regs.r8 {
                             SHAREMEM => {
-                                let r8 = regs.r8;
-                                let r9 = regs.r9;
+                                //let r8 = regs.r8;
+                                //let r9 = regs.r9;
                                 let r10 = regs.r10;
                                 let r11 = regs.r11;
-                                let r12 = regs.r12;
-                                let r13 = regs.r13;
-                                let r14 = regs.r14;
-                                let r15 = regs.r15;
+                                //let r12 = regs.r12;
+                                //let r13 = regs.r13;
+                                //let r14 = regs.r14;
+                                //let r15 = regs.r15;
                                 //println!("r8: {r8:x}, r9: {r9:x}, r10: {r10:x}, r11: {r11:x}, r12: {r12:x}, r13: {r13:x}, r14: {r14:x}, r15: {r15:x}");
                                 ExitReason::SharedMem(
                                     String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
@@ -394,7 +392,7 @@ impl NyxVM {
                             }
                             SNAPSHOT => ExitReason::RequestSnapshot,
                             EXECDONE => ExitReason::ExecDone(regs.r9),
-                            _ => ExitReason::Hypercall(regs.r8, regs.r9, regs.r10, regs.r11),
+                            _ => ExitReason::Hypercall(regs.r8, regs.r9, regs.r10, regs.r11, regs.r12),
                         };
                         exit = Some(hypercall)
                     } else {

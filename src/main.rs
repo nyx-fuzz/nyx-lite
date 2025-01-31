@@ -111,7 +111,6 @@ fn main_exec() -> Result<()> {
         return Ok(());
     }
 
-    // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = vmm::logger::DEFAULT_INSTANCE_ID.to_string();
     validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
@@ -136,8 +135,10 @@ fn main_exec() -> Result<()> {
     })?;
     info!("Running NYX-lite");
 
+    // the signal handlers only seem to handle jailer syscall metrics. We won't need that - our timeout detection has it's own signal handler
     register_signal_handlers()?;
 
+    // This was causing slowdown, when making many file descriptors on legacy firecracker reset - our rests don't make new fds, so this shouldn't matter
     if let Err(err) = resize_fdtable() {
         match err {
             // These errors are non-critical: In the worst case we have worse snapshot restore
@@ -164,9 +165,9 @@ fn main_exec() -> Result<()> {
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
     let mut vm = NyxVM::new(instance_id.clone(), &vmm_config_json.unwrap());
-    let mut snap = None;
+    let mut snapshot = None;
     let mut apply_count = 0;
-    let mut addr = 0;
+    let mut shared_vaddr = 0;
     loop {
         let timeout = Duration::from_secs(2);
         let exit_reason = vm.run(timeout);
@@ -174,19 +175,19 @@ fn main_exec() -> Result<()> {
             ExitReason::Timeout => {
                 println!("execution timed out");
             }
-            ExitReason::Hypercall(num, arg1, arg2, arg3) => {
+            ExitReason::Hypercall(num, arg1, arg2, arg3, arg4) => {
                 println!("got hypercall {:x}({:x}, {:x} {:x})", num, arg1, arg2, arg3);
             }
             ExitReason::RequestSnapshot => {
-                snap = Some(vm.take_snapshot());
+                snapshot = Some(vm.take_snapshot());
             }
             ExitReason::ExecDone(exit_code) => {
                 if arguments.flag_present("snapshot") && apply_count < 100 {
                     apply_count += 1;
                     println!(">>> RESTORE SNAPSHOT");
-                    vm.apply_snapshot(snap.as_ref().unwrap());
+                    vm.apply_snapshot(snapshot.as_ref().unwrap());
                     // update shared memory
-                    vm.write_current_u64(addr, 0xabcdef12_34567890 + apply_count);
+                    vm.write_current_u64(shared_vaddr, 0xabcdef12_34567890 + apply_count);
                 } else {
                     println!(">>> NO RESTORE - JUST CONTINUE");
                 }
@@ -197,7 +198,7 @@ fn main_exec() -> Result<()> {
                     name, saddr, size
                 );
                 println!("Found: {:x}", vm.read_current_u64(saddr));
-                addr = saddr;
+                shared_vaddr= saddr;
             }
             ExitReason::Shutdown => {
                 println!(">>> HYPERCALL SHUTDOWN");
