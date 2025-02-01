@@ -8,11 +8,9 @@ extern crate utils;
 extern crate vmm;
 
 use std::fs::{self};
-use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -41,25 +39,6 @@ fn main() -> ExitCode {
 fn main_exec() -> Result<()> {
     // Initialize the logger.
     LOGGER.init()?;
-
-    // We need this so that we can reset terminal to canonical mode if panic occurs.
-    let stdin = io::stdin();
-
-    // Start firecracker by setting up a panic hook, which will be called before
-    // terminating as we're building with panic = "abort".
-    // It's worth noting that the abort is caused by sending a SIG_ABORT signal to the process.
-    // panic::set_hook(Box::new(move |info| {
-    //     // We're currently using the closure parameter, which is a &PanicInfo, for printing the
-    //     // origin of the panic, including the payload passed to panic! and the source code location
-    //     // from which the panic originated.
-    //     error!("NYX-lite {}", info);
-    //     if let Err(err) = stdin.lock().set_canon_mode() {
-    //         error!(
-    //             "Failure while trying to reset stdin to canonical mode: {}",
-    //             err
-    //         );
-    //     }
-    // }));
 
     let mut arg_parser =
         ArgParser::new()
@@ -176,12 +155,12 @@ fn main_exec() -> Result<()> {
                 println!("execution timed out");
             }
             ExitReason::Hypercall(num, arg1, arg2, arg3, arg4) => {
-                println!("got hypercall {:x}({:x}, {:x} {:x})", num, arg1, arg2, arg3);
+                println!("got hypercall {:x}({:x}, {:x} {:x} {:x}])", num, arg1, arg2, arg3, arg4);
             }
             ExitReason::RequestSnapshot => {
                 snapshot = Some(vm.take_snapshot());
             }
-            ExitReason::ExecDone(exit_code) => {
+            ExitReason::ExecDone(_exit_code) => {
                 if arguments.flag_present("snapshot") && apply_count < 100 {
                     apply_count += 1;
                     println!(">>> RESTORE SNAPSHOT");

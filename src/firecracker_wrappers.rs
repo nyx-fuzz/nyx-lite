@@ -9,7 +9,7 @@ use vmm::cpu_config::templates::GetCpuTemplate;
 use vmm::resources::VmResources;
 use vmm::vmm_config::instance_info::InstanceInfo;
 use vmm::vstate::memory::GuestMemoryExtension;
-use vmm::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vmm::vstate::memory::GuestMemoryMmap;
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, VcpuHandle};
@@ -142,7 +142,7 @@ pub fn build_microvm_for_boot(
         cpu_template.kvm_capabilities.clone(),
     )?;
 
-    /// BEGIN NYX-LITE PATCH
+    // BEGIN NYX-LITE PATCH
     assert_eq!(vcpus.len(), 1);
     let debug_struct = kvm_guest_debug {
         // Configure the vcpu so that a KVM_DEBUG_EXIT would be generated
@@ -154,7 +154,7 @@ pub fn build_microvm_for_boot(
     };
 
     vcpus[0].kvm_vcpu.fd.set_guest_debug(&debug_struct).unwrap();
-    /// END NYX-LITE PATCH
+    // END NYX-LITE PATCH
     // The boot timer device needs to be the first device attached in order
     // to maintain the same MMIO address referenced in the documentation
     // and tests.

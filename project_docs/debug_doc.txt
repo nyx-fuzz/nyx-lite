@@ -30,3 +30,79 @@ The number of available virtio descriptors is greater than queue size!
 [   69.889342] I/O error, dev vda, sector 524424 op 0x1:(WRITE) flags 0x4800 phys_seg 1 prio class 2
 [   69.890240] Buffer I/O error on device vda, logical block 69633
 [   69.890840] Buffer I/O error on device vda, logical block 69632
+
+thread 'event_thread' panicked at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:517:17:
+The number of available virtio descriptors is greater than queue size!
+stack backtrace:
+   0: rust_begin_unwind
+             at /rustc/129f3b9964af4d4a709d1383930ade12dfe7c081/library/std/src/panicking.rs:652:5
+   1: core::panicking::panic_fmt
+             at /rustc/129f3b9964af4d4a709d1383930ade12dfe7c081/library/core/src/panicking.rs:72:14
+   2: vmm::devices::virtio::queue::Queue::try_enable_notification
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:517:17
+   3: vmm::devices::virtio::queue::Queue::pop_or_enable_notification
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:356:12
+   4: vmm::devices::virtio::block::virtio::device::VirtioBlock::process_queue
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/block/virtio/device.rs:435:32
+   5: vmm::devices::virtio::block::virtio::device::VirtioBlock::process_virtio_queues
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/block/virtio/device.rs:396:9
+   6: vmm::devices::virtio::block::virtio::device::VirtioBlock::process_queue_event
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/block/virtio/device.rs:390:13
+   7: vmm::devices::virtio::block::virtio::event_handler::<impl event_manager::MutEventSubscriber for vmm::devices::virtio::block::virtio::device::VirtioBlock>::process
+             at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/block/virtio/event_handler.rs:88:40
+   8: <std::sync::mutex::Mutex<T> as event_manager::EventSubscriber>::process
+             at /home/me/.cargo/registry/src/index.crates.io-6f17d22bba15001f/event-manager-0.4.0/src/lib.rs:244:9
+   9: <alloc::sync::Arc<T> as event_manager::EventSubscriber>::process
+             at /home/me/.cargo/registry/src/index.crates.io-6f17d22bba15001f/event-manager-0.4.0/src/lib.rs:184:9
+  10: <alloc::sync::Arc<T> as event_manager::MutEventSubscriber>::process
+             at /home/me/.cargo/registry/src/index.crates.io-6f17d22bba15001f/event-manager-0.4.0/src/lib.rs:194:22
+  11: event_manager::manager::EventManager<S>::dispatch_events
+             at /home/me/.cargo/registry/src/index.crates.io-6f17d22bba15001f/event-manager-0.4.0/src/manager.rs:157:17
+  12: event_manager::manager::EventManager<S>::run_with_timeout
+             at /home/me/.cargo/registry/src/index.crates.io-6f17d22bba15001f/event-manager-0.4.0/src/manager.rs:133:9
+  13: nyx_lite::nyx_vm::NyxVM::new::{{closure}}
+             at /data/proggen/rust/nyx_lite/src/nyx_vm.rs:141:32
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+2025-01-31T18:14:34.417316025 [anonymous-instance:main:INFO:src/e2e_test_main.rs:107] TEST: Trying to take a snapshot
+event thread handled 0 events
+event thread handled 0 events
+event thread handled 0 events
+event thread handled 0 events
+2025-01-31T18:14:37.483809685 [anonymous-instance:main:INFO:src/e2e_test_main.rs:109] TEST: Trying to read/write shared memory
+2025-01-31T18:14:37.484059603 [anonymous-instance:main:INFO:src/e2e_test_main.rs:111] TEST: Ensure snapshots handle tsc correctly
+thread 'event_thread' panicked at /data/proggen/rust/firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:517:17:
+The number of available virtio descriptors is greater than queue size!
+stack backtrace:
+
+2025-01-31T18:15:35.758204066 [anonymous-instance:main:INFO:src/e2e_test_main.rs:107] TEST: Trying to take a snapshot
+event thread handled 0 events
+event thread handled 0 events
+event thread handled 0 events
+event thread handled 0 events
+2025-01-31T18:15:38.642846390 [anonymous-instance:main:INFO:src/e2e_test_main.rs:109] TEST: Trying to read/write shared memory
+event thread handled 1 events
+[ ... run succeeded ... ]
+
+
+with a sleep 2 before taking the snapshot, we no longer seem to see the virtio descriptors failue, and rather see the file reset timeout
+
+2025-01-31T18:55:16.808815586 [anonymous-instance:main:INFO:src/e2e_test_main.rs:117] TEST: Ensure filesystem state is reset
+++++++++++++++ RESET SNAPSHOT
+=================> CHECKING IF FILE EXISTS
+=================> FILE CREATE
+=================> WRITE VALUE
+=event thread handled 1 events
+event thread handled 1 events
+================> OPEN FILE A SECOND TIME
+=================> READ FILE
+=================> DONE
+++++++++++++++ RESET SNAPSHOT
+=================> CHECKING IF FILE EXISTS
+=================> FILE CREATE
+=================> WRITE VALUE
+ -----> RECIEVED TIMER EVENT
+event thread handled 1 events
+thread 'main' panicked at src/e2e_test_main.rs:255:18:
+unexpected exit Timeout

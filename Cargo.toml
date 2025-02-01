@@ -34,3 +34,4 @@ path = "src/e2e_test_main.rs"
 
 [profile.release]
 debug = true
+debug-assertions = true

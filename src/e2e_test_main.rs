@@ -11,13 +11,17 @@ use std::fs::{self};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use libc::{pthread_t, SIGSTOP};
 use nyx_lite::{BaseSnapshot, ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
+use utils::signal::Killable;
 use utils::validators::validate_instance_id;
+use vmm::devices::virtio::device::VirtioDevice;
 use vmm::logger::{error, info, LoggerConfig, LOGGER};
 
 fn main() -> ExitCode {
@@ -30,6 +34,23 @@ fn main() -> ExitCode {
     } else {
         info!("NYX-lite exiting successfully. exit_code=0");
         ExitCode::SUCCESS
+    }
+}
+
+struct SuspendForDebugger{}
+
+impl SuspendForDebugger{
+    pub fn now(){
+        SuspendForDebugger{}.kill(SIGSTOP).expect("failed to pause for debugger");
+    }
+}
+
+unsafe impl Killable for SuspendForDebugger{
+    fn pthread_handle(&self) -> pthread_t {
+        let pid = unsafe{libc::getpid()};
+        let target_thread = unsafe { libc::pthread_self() };
+        println!("suspending current_thread_id :{:?} in pid {:?}", target_thread, pid);
+        target_thread
     }
 }
 
@@ -127,13 +148,19 @@ const TEST_NUM :u64 = 0x7473657400000000;
 
 
 fn run_vm_test(vm:&mut NyxVM, timeout_millis: u64, desc: &str) -> ExitReason{
-    let timeout = Duration::from_millis(timeout_millis);
-    let exit_reason = vm.run(timeout);
-    if let ExitReason::Hypercall(FAILTEST, err_ptr, _, _, _) = exit_reason {
-        let err = String::from_utf8_lossy(&vm.read_cstr_current(err_ptr)).to_string();
-        panic!("Test {desc} failed with error: {err}");
+    loop {
+        let timeout = Duration::from_millis(timeout_millis);
+        let exit_reason = vm.run(timeout);
+        if let ExitReason::Hypercall(FAILTEST, err_ptr, _, _, _) = exit_reason {
+            let err = String::from_utf8_lossy(&vm.read_cstr_current(err_ptr)).to_string();
+            panic!("Test {desc} failed with error: {err}");
+        }
+        if let ExitReason::DebugPrint(val) = exit_reason {
+            println!("DBGPRINT: {val}");
+        } else {
+            return exit_reason;
+        }
     }
-    return exit_reason;
 }
 
 pub fn test_boot_shared_mem(vm: &mut NyxVM) -> u64 {
@@ -233,7 +260,7 @@ pub fn test_timeout(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) 
 pub fn test_subprocess(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+4);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure the guest can spawn new processes");
+    let exit_reason = run_vm_test(vm, 500, "test_subprocess: ensure the guest can spawn new processes");
     match exit_reason {
         ExitReason::ExecDone(code) => { assert_eq!(code, 23, "subprocess test should yield code 23")}, 
         _ => panic!("unexpected exit {exit_reason:?}")
@@ -242,13 +269,29 @@ pub fn test_subprocess(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsho
 
 pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
     // run twice to ensure the files get reset correctly
+    // test writes
     for _ in 0..2 {
         vm.apply_snapshot(snapshot);
         vm.write_current_u64(shared_vaddr, TEST_NUM+5);
         let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure that the file system is reset on snapshots");
         match exit_reason {
             ExitReason::ExecDone(code) => { assert_eq!(code, 42, "filesystem test should yield code 42")}, 
-            _ => panic!("unexpected exit {exit_reason:?}")
+            _ => {
+                //SuspendForDebugger::now();
+                panic!("unexpected exit {exit_reason:?}");
+            }
+        };
+    }
+    // test reads
+    for _ in 0..2 {
+        vm.apply_snapshot(snapshot);
+        vm.write_current_u64(shared_vaddr, TEST_NUM+6);
+        let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure that the file system is reset on snapshots");
+        match exit_reason {
+            ExitReason::ExecDone(code) => { assert_eq!(code, 42, "filesystem test should yield code 42")}, 
+            _ => {
+                panic!("unexpected exit {exit_reason:?}");
+            }
         };
     }
 }

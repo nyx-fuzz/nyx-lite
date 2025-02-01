@@ -1,9 +1,9 @@
-use std::{sync::{Arc, Mutex}, time::Duration};
+use std::time::Duration;
 
 use event_manager::{EventOps, EventSet, Events, MutEventSubscriber};
 use timerfd::{SetTimeFlags, TimerFd, TimerState};
 use utils::signal::{sigrtmin, Killable};
-use vmm::{vstate::vcpu::VCPU_RTSIG_OFFSET, Vmm};
+use vmm::vstate::vcpu::VCPU_RTSIG_OFFSET;
 
 use libc::pthread_t;
 
@@ -33,7 +33,7 @@ impl TimerEvent{
 
 impl MutEventSubscriber for TimerEvent {
     // Handle an event for queue or rate limiter.
-    fn process(&mut self, event: Events, ops: &mut EventOps) {
+    fn process(&mut self, event: Events, _ops: &mut EventOps) {
         let source = event.data();
         let event_set = event.event_set();
 
@@ -44,7 +44,6 @@ impl MutEventSubscriber for TimerEvent {
                 event_set, source
             );
         }
-        println!(" -----> RECIEVED TIMER EVENT");
         self.timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
         let sig_num_kick = sigrtmin() + VCPU_RTSIG_OFFSET;
         self.kill(sig_num_kick).unwrap();

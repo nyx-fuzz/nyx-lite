@@ -19,3 +19,5 @@ sudo mount $FS $MOUNTDIR
 sudo docker cp $CONTAINER_ID:/ $MOUNTDIR
 sudo umount $MOUNTDIR
 rm -r $MOUNTDIR
+docker stop $CONTAINER_ID
+docker rm $CONTAINER_ID

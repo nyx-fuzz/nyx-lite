@@ -40,13 +40,14 @@ const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
 const NYX_LITE: u64 = 0x6574696c2d78796e;
 const SHAREMEM: u64 = 0x6d656d6572616873;
+const DBGPRINT: u64 = 0x746e697270676264;
 pub struct NyxVM {
-    vmm: Arc<Mutex<Vmm>>,
-    vcpu: Vcpu,
-    event_thread_handle: JoinHandle<Result<(), anyhow::Error>>,
-    vm_resources: VmResources,
-    block_devices: Vec<Arc<Mutex<Block>>>,
-    timeout_timer: Arc<Mutex<TimerEvent>>,
+    pub vmm: Arc<Mutex<Vmm>>,
+    pub vcpu: Vcpu,
+    pub event_thread_handle: JoinHandle<Result<(), anyhow::Error>>,
+    pub vm_resources: VmResources,
+    pub block_devices: Vec<Arc<Mutex<Block>>>,
+    pub timeout_timer: Arc<Mutex<TimerEvent>>,
 }
 
 pub struct BlockDeviceSnapshot {
@@ -85,6 +86,7 @@ pub enum ExitReason {
     RequestSnapshot,
     ExecDone(u64),
     SharedMem(String, u64, usize),
+    DebugPrint(String),
     Timeout,
     Breakpoint,
     SingleStep,
@@ -283,15 +285,15 @@ impl NyxVM {
         //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSCDEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
     }
 
-    pub fn apply_snapshot(&mut self, snap: &BaseSnapshot) {
+    pub fn apply_snapshot(&mut self, snapshot: &BaseSnapshot) {
         let mut vmm = self.vmm.lock().unwrap();
 
         let kvm_dirty_bitmap = vmm.get_dirty_bitmap().unwrap();
         let page_size: usize = mem::PAGE_SIZE as usize;
 
         for (slot, region) in vmm.guest_memory().iter().enumerate() {
-            let kvm_bitmap = kvm_dirty_bitmap.get(&slot).unwrap();
-            let firecracker_bitmap = region.bitmap();
+            let kvm_bitmap = kvm_dirty_bitmap.get(&slot).unwrap(); // kvm tracks pages dirtied during execution in this bitmap
+            let firecracker_bitmap = region.bitmap(); // firecracker device emulation etc tracks dirty pages in this bitmap
 
             for (i, v) in kvm_bitmap.iter().enumerate() {
                 for j in 0..64 {
@@ -300,9 +302,9 @@ impl NyxVM {
                     let page_offset = index * page_size;
                     let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
 
-                    if is_kvm_page_dirty || is_firecracker_page_dirty && (i % 1000 == 0) {
+                    if is_kvm_page_dirty || is_firecracker_page_dirty {
                         let target_addr = MemoryRegionAddress(page_offset.try_into().unwrap());
-                        let source_slice = &snap
+                        let source_slice = &snapshot
                             .memory
                             .get(page_offset..page_offset + page_size)
                             .unwrap();
@@ -320,21 +322,21 @@ impl NyxVM {
 
         self.vcpu
             .kvm_vcpu
-            .restore_state(&snap.state.vcpu_states[0])
+            .restore_state(&snapshot.state.vcpu_states[0])
             .unwrap();
 
         // we currently can't restore the net mmio device, only the block one
-        Self::apply_snapshot_mmio(&mut vmm.mmio_device_manager, snap);
+        Self::apply_snapshot_mmio(&mut vmm.mmio_device_manager, snapshot);
         // cpu might need to restore piodevices, investigate
         //Self::apply_snapshot_pio(&mut vmm.pio_device_manager, snap);
 
-        vmm.vm.restore_state(&snap.state.vm_state).unwrap();
+        vmm.vm.restore_state(&snapshot.state.vm_state).unwrap();
 
         // this should be done last, because KVM keeps tsc running - even when
         // the VM isn't. Doing this early will introduce additional
         // noise/nondeterminism
         drop(vmm);
-        self.apply_tsc(snap.tsc);
+        self.apply_tsc(snapshot.tsc);
     }
 
     pub fn sregs(&self) -> kvm_sregs {
@@ -388,6 +390,11 @@ impl NyxVM {
                                     String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
                                     r10,
                                     r11.try_into().unwrap(),
+                                )
+                            }
+                            DBGPRINT => {
+                                ExitReason::DebugPrint(
+                                    String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
                                 )
                             }
                             SNAPSHOT => ExitReason::RequestSnapshot,

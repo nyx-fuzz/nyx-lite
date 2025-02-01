@@ -14,6 +14,7 @@ const SHAREMEM: u64 = 0x6d656d6572616873;
 const DBG_CODE: u64 = 0x65646f635f676264;
 const FAILTEST: u64 = 0x747365746c696166;
 const TEST_NUM :u64 = 0x7473657400000000;
+const DBGPRINT: u64 = 0x746e697270676264;
 
 fn hypercall(hypercall_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) {
     unsafe {
@@ -52,6 +53,18 @@ fn hypercall_done(exit_code: u64) {
 
 fn hypercall_dbg_code(dbg_code: u64, arg1: u64) {
     hypercall(DBG_CODE, dbg_code, arg1, 0, 0);
+}
+
+fn hypercall_dbg_print(val: &str){
+    let c_name = CString::new(val).unwrap();
+    //   hypercall_num, arg1,                 , arg2                   , arg3         , arg4
+    hypercall(
+        DBGPRINT,
+        c_name.as_ptr() as u64,
+        0,
+        0,
+        0,
+    );
 }
 
 fn hypercall_fail_test(error: &str){
@@ -106,6 +119,7 @@ fn main() -> ExitCode {
         3 => test_timeout(),
         4 => test_run_subprocess(),
         5 => test_write_file(),
+	6 => test_read_file(),
         9999=> test_shutdown(),
         _ => hypercall_fail_test(&format!("no test found for {test_id}")),
     }
@@ -137,6 +151,14 @@ fn test_timeout(){
 
 fn test_run_subprocess(){
     use std::process::{Command, Stdio};
+
+    let mut child = Command::new("ls").args(["-lash","/"]).spawn().unwrap();
+    child.wait().unwrap();
+
+    let mut child = Command::new("cat").args(["/proc/iomem"]).spawn().unwrap();
+    child.wait().unwrap();
+
+    //thread::sleep(Duration::from_secs(5));
 
     let mut child = Command::new("md5sum")
     .stdin(Stdio::piped())
@@ -172,6 +194,15 @@ fn test_write_file(){
     if &str != expected {
         hypercall_fail_test(&format!("Expected to read filecontent: {expected} but got {str}"));
     }
+    hypercall_done(42);
+}
+
+
+fn test_read_file(){
+    let mut file = File::open("/resources/.keepme").unwrap();
+    let mut buff = vec![];
+    file.read_to_end(&mut buff).unwrap();
+    hypercall_dbg_print("=================> DONE");
     hypercall_done(42);
 }
 

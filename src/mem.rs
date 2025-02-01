@@ -2,11 +2,11 @@ use core::fmt;
 use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
 use crate::error::MemoryError;
-use vm_memory::bitmap::{Bitmap, BS, MS};
+use vm_memory::bitmap::BS;
 use vm_memory::{GuestUsize, VolatileSlice};
 use vmm::vstate::memory::{
-    Address, AtomicBitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
-    GuestRegionMmap, MemoryRegionAddress,
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    GuestRegionMmap
 };
 
 pub const M_PAGE_ALIGN: u64 = 0xffff_ffff_ffff_f000;

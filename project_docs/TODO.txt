@@ -4,19 +4,19 @@ PRE RELEASE:
   * Api that returns shared pages to process memory
   * Allow to not reset shared pages
   * Add testing
-* incremental snapshots
-* snapshot tree api
-* api to load dockerfiles directly
-* api to load a rootdir based fs directly
-* E2E testing setup
 * documentation
   * a minimal fuzzing example
   * cleaning up lint errors
   * comments on the actual api
 
+* see if we can redirect serial into a ptty
+* incremental snapshots
+* snapshot tree api
+* api to load dockerfiles directly
+* api to load a rootdir based fs directly
 * root snapshot sharing between processes
 * profiling snapshot performance
 * breakpoints
 * singlestepping
-* investigate syncing emulation to snapshots
 * investigate nested virtualization
+* investigate mke2fs to turn docker image into fs image
