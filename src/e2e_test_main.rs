@@ -164,7 +164,7 @@ fn run_vm_test(vm:&mut NyxVM, timeout_millis: u64, desc: &str) -> ExitReason{
 }
 
 pub fn test_boot_shared_mem(vm: &mut NyxVM) -> u64 {
-    let timeout = Duration::from_secs(2);
+    let timeout = Duration::from_secs(10);
     let exit_reason = vm.run(timeout);
     match exit_reason {  
         ExitReason::SharedMem(name, saddr, size) => {

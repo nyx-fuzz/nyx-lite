@@ -1,4 +1,9 @@
 vm_image/vmlinux-6.1.58
+vm_image/vmlinux-android
+vm_image/wheezy.ext4
+vm_image_android/build.prop
+vm_image_android/system.img
+vm_image_android/vbmeta.img
 vm_image/dockerimage/rootfs.ext4
 vm_image/dockerimage/resources/
 examples/test_*
