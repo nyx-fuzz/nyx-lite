@@ -4,13 +4,17 @@ PRE RELEASE:
   * Api that returns shared pages to process memory
   * Allow to not reset shared pages
   * Add testing
+  * make a generic Reader/Writer implementation for virtual memory
 * documentation
   * a minimal fuzzing example
   * cleaning up lint errors
   * comments on the actual api
-* breakpoints
-* singlestepping
+* Add memory breakpoints via kvm_memory_attributes
 
+* speed up breakpoints by not enabling/disabling them ALL the time.
+* ensure snapshot reset fixes VM shutdown
+* make it so that changing IP resets vm.continuation state as appropriate
+* make regs() and sregs() not read the register for every call
 * fix console output by redirect serial into a ptty
 * fix incremental snapshots 
 * snapshot tree api
@@ -20,4 +24,18 @@ PRE RELEASE:
   docker first
 * fix safe memory by allowing root snapshot sharing between processes 
 * profiling snapshot performance 
+* fix kvm dirty ring api to speed up snapshots
+* fix host atomic bitmap to speed up snapshots
 * fix nested virtualization
+* fix random bug:
+  thread 'event_thread' panicked at firecracker-nyx-patches/src/vmm/src/devices/virtio/queue.rs:517:17:
+  The number of available virtio descriptors is greater than queue size!
+  stack backtrace:
+    0: rust_begin_unwind
+    1: core::panicking::panic_fmt
+    2: vmm::devices::virtio::queue::Queue::pop_or_enable_notification
+    3: vmm::devices::virtio::block::virtio::device::VirtioBlock::process_queue
+    4: vmm::devices::virtio::block::virtio::event_handler::<impl event_manager::MutEventSubscriber for vmm::devices::virtio::block::virtio::device::VirtioBlock>::process
+    5: <std::sync::poison::mutex::Mutex<T> as event_manager::EventSubscriber>::process
+    6: event_manager::manager::EventManager<S>::run_with_timeout
+  note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.

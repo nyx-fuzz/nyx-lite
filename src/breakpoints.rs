@@ -19,13 +19,14 @@ impl Breakpoint {
 // A trait so users can define their own logic for deciding which breakpoints to handle.
 pub trait BreakpointManagerTrait{
     // should we forward the current breakpoint to the guest rather than handle it ourselfs?
-    fn forward_guest_bp(&self, cr3: u64, rip: u64) -> bool {
-        //println!(">> forward guest bp? YES!");
-        return true;
-    }
+    fn known_breakpoint(&self, cr3: u64, rip: u64) -> bool;
     fn disable_all_breakpoints(&mut self, vmm: &mut Vmm);
     fn enable_all_breakpoints(&mut self, vmm: &mut Vmm);
     fn add_breakpoint(&mut self, cr3: u64, vaddr: u64);
+
+    fn forward_guest_bp(&self, cr3: u64, rip: u64) -> bool {
+        return !self.known_breakpoint(cr3, rip);
+    }
 }
 
 pub struct BreakpointManager{
@@ -39,6 +40,10 @@ impl BreakpointManager{
 }
 
 impl BreakpointManagerTrait for BreakpointManager{
+    fn known_breakpoint(&self, cr3: u64, rip: u64) -> bool {
+        let known_bp = self.breakpoints.contains_key(&(cr3, rip));
+        return known_bp;
+    }
     fn disable_all_breakpoints(&mut self, vmm: &mut Vmm){
         for bp in self.breakpoints.values_mut(){
             vmm.write_virtual_u8(bp.cr3, bp.vaddr, bp.orig_val.unwrap()).unwrap();

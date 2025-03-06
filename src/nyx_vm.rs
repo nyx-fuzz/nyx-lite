@@ -1,5 +1,3 @@
-use core::num;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -10,7 +8,7 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use vmm::arch::DeviceType;
-use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST, MSR_IA32_VMX_EXIT_CTLS};
+use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
@@ -27,7 +25,7 @@ use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::vstate::memory::{
     Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress,
 };
-use vmm::vstate::vcpu::{DebugExitInfo, VcpuEmulation, VcpuError};
+use vmm::vstate::vcpu::VcpuEmulation;
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, FcExitCode, VcpuEvent};
@@ -36,15 +34,13 @@ use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKI
 use kvm_bindings::kvm_guest_debug;
 use kvm_bindings::KVM_GUESTDBG_ENABLE;
 use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
-use kvm_bindings::KVM_GUESTDBG_INJECT_DB;
 use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 
-use crate::breakpoints::{Breakpoint, BreakpointManager, BreakpointManagerTrait};
+use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
 use crate::firecracker_wrappers::build_microvm_for_boot;
-use crate::mem::{self, walk_virtual_pages, M_PAGE_ALIGN, M_PAGE_OFFSET, PAGE_SIZE};
 use crate::timer_event::TimerEvent;
 use crate::vm_continuation_statemachine::{VMExitUserEvent, VMContinuationState};
-use crate::mem::NyxMemExtension;
+use crate::mem::{self, NyxMemExtension};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub enum DebugState{

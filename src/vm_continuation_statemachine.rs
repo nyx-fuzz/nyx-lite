@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 pub use crate::nyx_vm::NyxVM;
-use crate::{disassembly::disassemble_print, UnparsedExitReason};
+use crate::UnparsedExitReason;
 
 #[derive(Clone,Debug,Eq, PartialEq, Hash)]
 pub enum VMExitUserEvent {
@@ -24,9 +24,10 @@ pub enum VMContinuationState{
 impl VMContinuationState{
     pub fn step(vm: &mut NyxVM, single_step:bool, timeout: Duration) -> VMExitUserEvent{
         loop{
+            //println!("LOOP {:?} requested singlestep {}", vm.continuation_state, single_step);
             let (new_state,res) = match vm.continuation_state{
                 Self::Main => Self::run_main(vm, single_step, timeout),
-                Self::ForceSingleStep => Self::force_ss(vm),
+                Self::ForceSingleStep => Self::force_ss(vm, single_step),
                 Self::ForceSingleStepInjectBPs => Self::force_ss_inject_bps(vm),
                 Self::EmulateHypercall => Self::emulate_hypercall(vm),
             };
@@ -59,7 +60,7 @@ impl VMContinuationState{
             UnparsedExitReason::Timeout => return (Self::Main, Some(VMExitUserEvent::Timeout)),
         };
     }
-    fn force_ss(vm: &mut NyxVM) -> (Self,Option<VMExitUserEvent>){
+    fn force_ss(vm: &mut NyxVM, user_requested_singlestep: bool) -> (Self,Option<VMExitUserEvent>){
         let single_step = true;
         let vmexit_on_swbp = true;
         vm.set_debug_state(single_step, vmexit_on_swbp);
@@ -71,7 +72,10 @@ impl VMContinuationState{
                 // happy case: we just got to single step & can now reapply
                 // breakpoints and continue as is
                 Self::assert_made_progress(vm); 
-                return (Self::Main, Some(VMExitUserEvent::SingleStep))
+                if user_requested_singlestep{
+                    return (Self::Main, Some(VMExitUserEvent::SingleStep))
+                }
+                return (Self::Main, None)
             }
             UnparsedExitReason::GuestBreakpoint => {
                 // To get here, we triggered a nyx-bp at address X (which we removed). IF there was a breakpoint under
@@ -134,8 +138,8 @@ impl VMContinuationState{
         vm.set_regs(&regs);
         return (Self::Main, None);
     }
-    fn assert_made_progress(vm: &mut NyxVM){
+    fn assert_made_progress(_vm: &mut NyxVM){
         // note: needs to handle self loops, str instructions etc
     }
-    fn assert_made_no_progress(vm: &mut NyxVM){}
+    fn assert_made_no_progress(_vm: &mut NyxVM){}
 }
