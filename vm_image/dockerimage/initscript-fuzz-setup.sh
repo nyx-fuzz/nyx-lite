@@ -27,7 +27,7 @@ start() {
   mount devpts /dev/pts -t devpts
   #start sshd
   #rc-service sshd start
-  /resources/test_guest_runner
+  /resources/guest_test
   echo "ABOUT TO SHUT DOWN VIA SHELL!"
   reboot -f 
   echo "STILL RUNNING???"

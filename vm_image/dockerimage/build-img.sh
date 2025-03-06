@@ -1,7 +1,12 @@
 set -e
 
 
-rustc --target=x86_64-unknown-linux-musl ../../examples/test_guest_runner.rs -o resources/test_guest_runner
+#rustc --target=x86_64-unknown-linux-musl ../../examples/test_guest_runner.rs -o 
+pushd ../../../test_binaries
+cargo build --bin guest_test --target=x86_64-unknown-linux-musl --release
+popd 
+rm resources/guest_test
+cp -L ../../../target/x86_64-unknown-linux-musl/release/guest_test resources/guest_test
 
 IMG_ID=$(docker build -q .)
 CONTAINER_ID=$(docker run -td $IMG_ID /bin/bash)

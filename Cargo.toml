@@ -19,6 +19,7 @@ kvm-ioctls = "0.17.0"
 vm-memory = "0.14.1"
 
 timerfd ="1.6.0"
+iced-x86 = "1.21.0"
 
 [lib]
 name = "nyx_lite"
@@ -31,6 +32,10 @@ path = "src/main.rs"
 [[bin]]
 name = "e2e_test"
 path = "src/e2e_test_main.rs"
+
+[[example]]
+name = "test_guest_runner"
+path = "examples/test_guest_runner"
 
 [profile.release]
 debug = true

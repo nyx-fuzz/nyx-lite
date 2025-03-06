@@ -2,13 +2,15 @@ use core::fmt;
 use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
 use crate::error::MemoryError;
-use vm_memory::bitmap::BS;
-use vm_memory::{GuestUsize, VolatileSlice};
+use vm_memory::bitmap::{AtomicBitmap, BS};
+use vm_memory::{AtomicAccess, ByteValued, GuestUsize, VolatileSlice};
 use vmm::vstate::memory::{
     Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
     GuestRegionMmap
 };
+use vmm::Vmm;
 
+type MResult<T> = Result<T, MemoryError>;
 pub const M_PAGE_ALIGN: u64 = 0xffff_ffff_ffff_f000;
 pub const M_PAGE_OFFSET: u64 = 0xfff;
 pub const FRAMES_PER_PAGE_TABLE: u64 = 0x1ff;
@@ -17,15 +19,137 @@ pub const M_PTE_PADDR: u64 = 0x000f_ffff_ffff_f000;
 pub const PAGE_SIZE: u64 = 0x1000;
 pub const BIT_PTE_PRESENT: u64 = 1;
 
-pub fn read_phys_u64(mem: &GuestMemoryMmap, paddr: u64) -> Result<u64, MemoryError> {
-    assert!(paddr & M_PAGE_OFFSET <= PAGE_SIZE - (std::mem::size_of::<u64>() as u64));
+pub fn read_phys<T: ByteValued + AtomicAccess>(mem: &GuestMemoryMmap, paddr: u64) -> MResult<T> {
+    let size = std::mem::size_of::<T>();
     return mem
         .load(GuestAddress(paddr), Ordering::Relaxed)
-        .map_err(|_| MemoryError::CantAccessPhysicalPage(GuestAddress(paddr)));
+        .map_err(|_| MemoryError::CantReadPhysicalPage(GuestAddress(paddr), size));
 }
 
-pub fn read_phys_u8(mem: &GuestMemoryMmap, paddr: u64) -> u64 {
-    return mem.load(GuestAddress(paddr), Ordering::Relaxed).unwrap();
+pub fn write_phys<T: ByteValued + AtomicAccess>(mem: &GuestMemoryMmap, paddr: u64, val: T)-> MResult<()>{
+    let size = std::mem::size_of::<T>();
+    assert!(paddr & M_PAGE_OFFSET <= PAGE_SIZE - (size as u64));
+    return mem.store(val, GuestAddress(paddr), Ordering::Relaxed)
+        .map_err(|_| MemoryError::CantWritePhysicalPage(GuestAddress(paddr), size));
+}
+
+pub fn read_phys_u64(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u64>{
+    return read_phys(mem, paddr);
+}
+pub fn read_phys_u8(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u8> {
+    return read_phys(mem, paddr)
+}
+
+pub trait NyxMemExtension{
+    fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress>;
+    fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T>;
+    fn write_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64, val: T) -> MResult<()>;
+
+    fn read_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64) -> MResult<T>;
+    fn write_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64, val: T) -> MResult<()>;
+
+    fn read_virtual_u8(&self, cr3: u64, vaddr: u64) -> MResult<u8>;
+    fn write_virtual_u8(&self, cr3: u64, vaddr: u64, val: u8) -> MResult<()>;
+    fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> MResult<u64>;
+    fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()>;
+    fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>;
+
+    fn read_virtual_bytes<'buffer>(&self, cr3: u64, vaddr: u64, buffer: &'buffer mut[u8]) -> MResult<usize>;
+}
+
+pub trait GetMem{
+    fn get_mem(&self) -> &GuestMemoryMmap;
+}
+
+impl GetMem for Vmm{
+    fn get_mem(&self) -> &GuestMemoryMmap {
+        self.guest_memory()
+    }
+}
+
+impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
+    fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>{
+        let mem = self.get_mem();
+        let mut res = Vec::new();
+        let mut cur_addr = guest_vaddr;
+        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
+            if !pte.present() || pte.missing_page() {
+                return res;
+            }
+            let slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
+            while cur_addr < pte.vaddrs.end {
+                let u8_char = slice.load::<u8>((cur_addr&M_PAGE_OFFSET) as usize, Ordering::Relaxed).unwrap();
+                res.push(u8_char);
+                cur_addr += 1;
+                if u8_char == 0 {
+                    return res;
+                }
+            }
+        }
+        return res;
+    }
+
+    fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress>{
+        let mem = self.get_mem();
+        let paddr = resolve_vaddr(mem, cr3, vaddr)?;
+        return Ok(GuestAddress(paddr));
+    }
+
+    fn read_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64) -> MResult<T> {
+        let mem = self.get_mem();
+        read_phys(mem, paddr)
+    }
+
+    fn write_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64, val: T) -> MResult<()> {
+        let mem = self.get_mem();
+        write_phys(mem, paddr, val)
+    }
+
+    fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T>{
+        let mem = self.get_mem();
+        let paddr = resolve_vaddr(mem, cr3, vaddr)?;
+        return read_phys(mem, paddr)
+    }
+
+    fn write_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64, value: T) -> MResult<()>{
+        let mem = self.get_mem();
+        let paddr = resolve_vaddr(mem, cr3, vaddr)?;
+        return write_phys(mem, paddr, value)
+    }
+
+    fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> MResult<u64>{
+        return self.read_virtual(cr3, vaddr);
+    }
+
+    fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()>{
+        return self.write_virtual(cr3, vaddr, val)
+    }
+    fn read_virtual_u8(&self, cr3: u64, vaddr: u64) -> MResult<u8> {
+        return self.read_virtual(cr3, vaddr);
+    }
+    fn write_virtual_u8(&self, cr3: u64, vaddr: u64, val: u8) -> MResult<()>{
+        return self.write_virtual(cr3, vaddr, val);
+    }
+
+    fn read_virtual_bytes<'buffer>(&self, cr3: u64, guest_vaddr: u64, buffer: &'buffer mut[u8]) -> MResult<usize> {
+        let mem = self.get_mem();
+        let mut num_bytes = 0;
+        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
+            if !pte.present() || pte.missing_page() {
+                return Ok(num_bytes);
+            }
+            let guest_slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
+            let page_vaddr = pte.vaddrs.start;
+            assert_eq!(guest_slice.len(), PAGE_SIZE as usize);
+            let slice_start = if page_vaddr < guest_vaddr { (guest_vaddr-page_vaddr) as usize } else {0};
+            let num_copied = guest_slice.subslice(slice_start, guest_slice.len()-slice_start).unwrap().copy_to(&mut buffer[num_bytes..]);
+            num_bytes += num_copied;
+            if num_copied >= buffer.len() {
+                break;
+            }
+        }
+        return Ok(num_bytes);
+    }
 }
 
 fn read_page_table_entry(
@@ -40,7 +164,7 @@ fn read_page_table_entry(
     return Err(MemoryError::PageNotPresent(GuestAddress(paddr), offset));
 }
 
-pub fn resolve_addr(mem: &GuestMemoryMmap, cr3: u64, vaddr: u64) -> Result<u64, MemoryError> {
+pub fn resolve_vaddr(mem: &GuestMemoryMmap, cr3: u64, vaddr: u64) -> MResult<u64> {
     let mask = M_PAGE_ALIGN;
     let (l1, l2, l3, l4, offset) = split_vaddr(vaddr);
     let pml4_addr = read_page_table_entry(mem, cr3 & mask, l1)?;
@@ -241,6 +365,9 @@ impl<'mem> PTEWalker<'mem> {
     }
 
     fn iter_next(&mut self) -> Option<PTE> {
+        // It appears that we see high kernel addresses sometimes (i.e.
+        // ffffffff823b1ad8 during the boot breakpoint vmexit). Those aren't
+        // handled correctly right now. Investigate expected behavior
         if self.offsets[0] >= 0x1ff {
             return None;
         }
@@ -294,14 +421,14 @@ pub struct VirtMappedRange {
 }
 
 impl VirtMappedRange {
-    pub fn new(cr3: u64, start: u64, end: u64) -> Self {
-        assert!(end >= start);
-        assert!(start & M_PAGE_OFFSET == 0);
-        assert!(end & M_PAGE_OFFSET == 0);
+    pub fn new(cr3: u64, start_page: u64, end_page: u64) -> Self {
+        assert!(end_page >= start_page);
+        assert!(start_page & M_PAGE_OFFSET == 0);
+        assert!(end_page & M_PAGE_OFFSET == 0);
         Self {
             cr3,
-            start,
-            end,
+            start: start_page,
+            end: end_page,
             tlb: vec![],
         }
     }
@@ -323,7 +450,7 @@ impl VirtMappedRange {
                 ));
             }
             if !pte.missing_page() {
-                return Err(MemoryError::CantAccessPhysicalPage(pte.phys_addr()));
+                return Err(MemoryError::CantAccessMissingPhysicalPage(pte.phys_addr()));
             }
             self.tlb.push(pte.phys_addr());
         }
@@ -410,7 +537,7 @@ mod tests {
             GuestAddress(l3_addr + 8 * (((vaddr + 2 * PAGE_SIZE) >> 12) & M_PTE_OFFSET)),
             target_3 | BIT_PTE_PRESENT,
         );
-        assert_eq!(resolve_addr(&mem, fake_cr3, vaddr).unwrap(), target_1);
+        assert_eq!(resolve_vaddr(&mem, fake_cr3, vaddr).unwrap(), target_1);
         let walk = walk_virtual_pages(&mem, fake_cr3, vaddr, vaddr + PAGE_SIZE * 2)
             .map(|pte| (pte.vaddrs.start, pte.phys_addr()))
             .collect::<Vec<_>>();
@@ -434,9 +561,9 @@ mod tests {
         let t2 = make_vpage(&mem, cr3, 0x42000, &mut allocated_pages);
         let t3 = make_vpage(&mem, cr3, 0x43000, &mut allocated_pages);
 
-        assert_eq!(resolve_addr(&mem, cr3, 0x41000).unwrap(), t1.0);
-        assert_eq!(resolve_addr(&mem, cr3, 0x42000).unwrap(), t2.0);
-        assert_eq!(resolve_addr(&mem, cr3, 0x43000).unwrap(), t3.0);
+        assert_eq!(resolve_vaddr(&mem, cr3, 0x41000).unwrap(), t1.0);
+        assert_eq!(resolve_vaddr(&mem, cr3, 0x42000).unwrap(), t2.0);
+        assert_eq!(resolve_vaddr(&mem, cr3, 0x43000).unwrap(), t3.0);
         let walk = walk_virtual_pages(&mem, cr3, 0x41000, 0x41000 + PAGE_SIZE * 2)
             .map(|pte| (pte.vaddrs.start, pte.phys_addr()))
             .collect::<Vec<_>>();

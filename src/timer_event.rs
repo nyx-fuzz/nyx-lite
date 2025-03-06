@@ -23,7 +23,9 @@ impl TimerEvent{
         Self{timer: TimerFd::new().unwrap(), target_thread}
     }
     pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timer.set_state(TimerState::Oneshot(timeout), SetTimeFlags::Default);
+        if timeout != Duration::MAX{
+            self.timer.set_state(TimerState::Oneshot(timeout), SetTimeFlags::Default);
+        }
     }
     pub fn disable(&mut self){
         self.timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);

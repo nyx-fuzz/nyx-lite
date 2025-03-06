@@ -136,6 +136,10 @@ fn main_exec() -> Result<()> {
     test_subprocess(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure filesystem state is reset");
     test_filesystem_reset(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure debug facilities work");
+    test_single_step(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure guest bp are injected properly");
+    test_guest_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure VM shuts down cleanly");
     test_shutdown(&mut vm, shared_vaddr, &snapshot);
     info!("RAN ALL TESTS SUCCESSFULLY");
@@ -294,6 +298,88 @@ pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseS
             }
         };
     }
+}
+
+pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+7);
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure that the file system is reset on snapshots");
+    let (cr3, code_addr) = match exit_reason {
+        ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 3366, "expect dbgcode 3366");
+            let cr3 = vm.sregs().cr3;
+            let code_addr = vm.regs().rip;
+            (cr3, code_addr)
+        },
+        _ => {
+            panic!("unexpected exit {exit_reason:?}");
+        }
+    };
+    // Code after the DBG_CODE hypercall is:
+    // int 3         # cc <- rip is here
+    // mov rax,1234  # 48 c7 c0 d2 04 00 00
+    // add rax,1     # 48 83 c0 01
+    // add rax,2     # 48 83 c0 02 
+    // add rax,3     # 48 83 c0 03
+    // add rax,4     # 48 83 c0 04
+    println!("single stepping from code addr {}",code_addr);
+    let exit_reason = vm.single_step(Duration::from_millis(10));
+    match exit_reason {
+        ExitReason::SingleStep => {/* EXPECTED */},
+        _ => { panic!("unexpected exit {exit_reason:?}"); }
+    };
+    // note this test sometimes fails for some reason
+    assert_eq!(cr3, vm.sregs().cr3, "cr3 changed during singlestep");
+    assert_eq!(vm.regs().rax, 1234);
+    assert_eq!(vm.regs().rip, code_addr + 1 + 7); // 1 = sizeof(int 3), 7 = sizeof(mov rax,1234)
+    let exit_reason = vm.single_step(Duration::from_millis(10));
+    match exit_reason {
+        ExitReason::SingleStep => {/* EXPECTED */},
+        _ => { panic!("unexpected exit {exit_reason:?}"); }
+    };
+    assert_eq!(cr3, vm.sregs().cr3);
+    assert_eq!(vm.regs().rax, 1235);
+    assert_eq!(vm.regs().rip, code_addr + 1 + 7 + 4); // 1+ 7 + 4 = sizeof(int 3) + sizeof(mov rax,1234) + sizeof(add rax,1)
+    let exit_reason = vm.single_step(Duration::from_millis(10));
+    match exit_reason {
+        ExitReason::SingleStep => {/* EXPECTED */},
+        _ => { panic!("unexpected exit {exit_reason:?}"); }
+    };
+    assert_eq!(cr3, vm.sregs().cr3);
+    assert_eq!(vm.regs().rax, 1237);
+    assert_eq!(vm.regs().rip, code_addr + 1+ 7 + 2*4); // 1+ 7 + 2*4 = sizeof(int 3) + sizeof(mov rax,1234) + 2*sizeof(add rax,1)
+}
+
+
+pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+8);
+    println!("0===== START TEST");
+    let exit_reason = run_vm_test(vm, 100, "test_guest_bp: run until first hypercall");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => {
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 1234, "expect dbgcode 1234");
+            assert_eq!(arg2, 42, "expected the global to be 42 initially");
+        },
+        _ => {
+            panic!("unexpected exit {exit_reason:?}");
+        }
+    };
+    println!("1===== HIT FIRST HYPERCALL IN GEUST BP TEST -> continue running (should hit 2 guest bps)");
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure that the breakpoints are triggering the signal handler");
+    println!("2===== HIT SECOND HYPERCALL");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => {
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 1234, "expect dbgcode 1234");
+            assert_eq!(arg2, 42 + 2 * 13, "expect to call the signal handler twice");
+        },
+        _ => {
+            panic!("unexpected exit {exit_reason:?}");
+        }
+    };
 }
 
 pub fn test_shutdown(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {

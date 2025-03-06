@@ -8,15 +8,16 @@ PRE RELEASE:
   * a minimal fuzzing example
   * cleaning up lint errors
   * comments on the actual api
-
-* see if we can redirect serial into a ptty
-* incremental snapshots
-* snapshot tree api
-* api to load dockerfiles directly
-* api to load a rootdir based fs directly
-* root snapshot sharing between processes
-* profiling snapshot performance
 * breakpoints
 * singlestepping
-* investigate nested virtualization
+
+* fix console output by redirect serial into a ptty
+* fix incremental snapshots 
+* snapshot tree api
+* fix add api to load dockerfiles directly
 * investigate mke2fs to turn docker image into fs image
+* fix api to load a rootdir based fs directly, rather than going through
+  docker first
+* fix safe memory by allowing root snapshot sharing between processes 
+* profiling snapshot performance 
+* fix nested virtualization

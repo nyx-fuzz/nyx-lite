@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+extern crate libc;
+
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
 const NYX_LITE: u64 = 0x6574696c2d78796e;
@@ -119,7 +121,8 @@ fn main() -> ExitCode {
         3 => test_timeout(),
         4 => test_run_subprocess(),
         5 => test_write_file(),
-	6 => test_read_file(),
+        6 => test_read_file(),
+        7 => test_debugging(),
         9999=> test_shutdown(),
         _ => hypercall_fail_test(&format!("no test found for {test_id}")),
     }
@@ -206,6 +209,21 @@ fn test_read_file(){
     hypercall_done(42);
 }
 
+fn test_debugging(){
+    unsafe {
+        asm!(
+            "int 3", // Hypercall DBG_CODE 3366
+            "mov rax,1234",
+            "add rax,1",
+            "add rax,2",
+            "add rax,3",
+            "add rax,4",
+            in("rax") NYX_LITE,
+            in("r8") DBG_CODE,
+            in("r9") 3366
+        );
+    }
+}
 
 fn test_shutdown(){
     //system call on 64-bit Linux, syscall number in rax, and args: rdi, rsi, rdx, r10, r8, and r9

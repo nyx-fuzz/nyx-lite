@@ -2,5 +2,8 @@ pub mod error;
 pub mod firecracker_wrappers;
 pub mod mem;
 pub mod timer_event;
+pub mod breakpoints;
 pub mod nyx_vm;
 pub use nyx_vm::*;
+pub mod vm_continuation_statemachine;
+pub mod disassembly;

@@ -1,3 +1,5 @@
+use core::num;
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -8,7 +10,7 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use vmm::arch::DeviceType;
-use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
+use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST, MSR_IA32_VMX_EXIT_CTLS};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
@@ -25,22 +27,39 @@ use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::vstate::memory::{
     Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress,
 };
-use vmm::vstate::vcpu::VcpuEmulation;
+use vmm::vstate::vcpu::{DebugExitInfo, VcpuEmulation, VcpuError};
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, FcExitCode, VcpuEvent};
 
-use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs};
+use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_INJECT_BP};
+use kvm_bindings::kvm_guest_debug;
+use kvm_bindings::KVM_GUESTDBG_ENABLE;
+use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
+use kvm_bindings::KVM_GUESTDBG_INJECT_DB;
+use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 
+use crate::breakpoints::{Breakpoint, BreakpointManager, BreakpointManagerTrait};
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::mem::{self, walk_virtual_pages, M_PAGE_ALIGN, M_PAGE_OFFSET, PAGE_SIZE};
 use crate::timer_event::TimerEvent;
+use crate::vm_continuation_statemachine::{VMExitUserEvent, VMContinuationState};
+use crate::mem::NyxMemExtension;
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+pub enum DebugState{
+    Breakpoint,
+    SingleStep,
+    Continue,
+}
 
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
 const NYX_LITE: u64 = 0x6574696c2d78796e;
 const SHAREMEM: u64 = 0x6d656d6572616873;
 const DBGPRINT: u64 = 0x746e697270676264;
+const DBG_EXCEPTION_BREAKPOINT : u32 = 3;
+const DBG_EXCEPTION_SINGLESTEP : u32 = 1;
 pub struct NyxVM {
     pub vmm: Arc<Mutex<Vmm>>,
     pub vcpu: Vcpu,
@@ -48,6 +67,8 @@ pub struct NyxVM {
     pub vm_resources: VmResources,
     pub block_devices: Vec<Arc<Mutex<Block>>>,
     pub timeout_timer: Arc<Mutex<TimerEvent>>,
+    pub continuation_state: VMContinuationState,
+    pub breakpoint_manager: Box<dyn BreakpointManagerTrait>,
 }
 
 pub struct BlockDeviceSnapshot {
@@ -77,6 +98,18 @@ pub struct BaseSnapshot {
     memory: Vec<u8>,
     state: MicrovmState,
     tsc: u64,
+    continuation_state: VMContinuationState
+}
+
+#[derive(Debug)]
+pub enum UnparsedExitReason {
+    Shutdown,
+    Hypercall,
+    Timeout,
+    NyxBreakpoint,
+    GuestBreakpoint,
+    SingleStep,
+    Interrupted,
 }
 
 #[derive(Debug)]
@@ -162,6 +195,8 @@ impl NyxVM {
             event_thread_handle,
             block_devices,
             timeout_timer,
+            continuation_state: VMContinuationState::Main,
+            breakpoint_manager: Box::new(BreakpointManager::new()),
         };
     }
 
@@ -202,6 +237,7 @@ impl NyxVM {
             memory,
             state: self.save_vm_state(&vmm),
             tsc,
+            continuation_state: self.continuation_state.clone()
         };
     }
 
@@ -337,6 +373,7 @@ impl NyxVM {
         // noise/nondeterminism
         drop(vmm);
         self.apply_tsc(snapshot.tsc);
+        self.continuation_state = snapshot.continuation_state.clone();
     }
 
     pub fn sregs(&self) -> kvm_sregs {
@@ -350,7 +387,57 @@ impl NyxVM {
         self.vcpu.kvm_vcpu.fd.set_regs(regs).unwrap();
     }
 
-    pub fn run(&mut self, timeout: Duration) -> ExitReason {
+    pub fn set_debug_state(&mut self, single_step: bool, vmexit_on_swbp: bool ){
+        let mut control = KVM_GUESTDBG_ENABLE;
+        if single_step {
+            control |= KVM_GUESTDBG_SINGLESTEP;
+            control |= KVM_GUESTDBG_BLOCKIRQ;
+        };
+        control |= if vmexit_on_swbp {KVM_GUESTDBG_USE_SW_BP} else {KVM_GUESTDBG_INJECT_BP};
+        let dbg_info = kvm_guest_debug {
+            control,
+            pad: 0,
+            // Reset all arch-specific debug registers
+            arch: Default::default(),
+        };
+        self.vcpu.kvm_vcpu.fd.set_guest_debug(&dbg_info).unwrap();
+    }
+
+    pub fn is_nyx_hypercall(&self) -> bool {
+        let regs = self.regs();
+        return regs.rax == NYX_LITE;
+    }
+
+    pub fn is_nyx_swbp(&mut self) -> bool {
+        return false;
+    }
+
+    pub fn parse_hypercall(&self) -> ExitReason{
+        let regs = self.regs();
+        if self.is_nyx_hypercall(){
+            let hypercall = match regs.r8 {
+                SHAREMEM => {
+                    ExitReason::SharedMem(
+                        String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
+                        regs.r10,
+                        regs.r11.try_into().unwrap(),
+                    )
+                }
+                DBGPRINT => {
+                    ExitReason::DebugPrint(
+                        String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
+                    )
+                }
+                SNAPSHOT => ExitReason::RequestSnapshot,
+                EXECDONE => ExitReason::ExecDone(regs.r9),
+                _ => ExitReason::Hypercall(regs.r8, regs.r9, regs.r10, regs.r11, regs.r12),
+            };
+            return hypercall;
+        } 
+        panic!("Don't call parse_hypercall on a non-hypercall vmexit!");
+    }
+
+    pub fn run_inner(&mut self, timeout: Duration) -> UnparsedExitReason{
         let start_time = time::Instant::now();
         self.timeout_timer.lock().unwrap().set_timeout(timeout);
         loop {
@@ -361,56 +448,37 @@ impl NyxVM {
                 // Emulation was interrupted, check external events.
                 VcpuEmulation::Interrupted => {
                     if time::Instant::now().duration_since(start_time) >= timeout {
-                        exit = Some(ExitReason::Timeout);
+                        exit = Some(UnparsedExitReason::Timeout);
                     } else {
                         println!("[STOP] interrupt");
-                        exit = Some(ExitReason::Interrupted);
+                        exit = Some(UnparsedExitReason::Interrupted);
                     }
                 }
                 VcpuEmulation::Stopped => {
-                    //println!("[STOP] shutdown");
-                    exit = Some(ExitReason::Shutdown);
+                    exit = Some(UnparsedExitReason::Shutdown);
                 }
-                VcpuEmulation::PausedBreakpoint => {
-                    //println!("[STOP] breakpoint");
+                VcpuEmulation::DebugEvent(dbg) => {
                     let regs = self.regs();
-                    if regs.rax == NYX_LITE {
-                        let hypercall = match regs.r8 {
-                            SHAREMEM => {
-                                //let r8 = regs.r8;
-                                //let r9 = regs.r9;
-                                let r10 = regs.r10;
-                                let r11 = regs.r11;
-                                //let r12 = regs.r12;
-                                //let r13 = regs.r13;
-                                //let r14 = regs.r14;
-                                //let r15 = regs.r15;
-                                //println!("r8: {r8:x}, r9: {r9:x}, r10: {r10:x}, r11: {r11:x}, r12: {r12:x}, r13: {r13:x}, r14: {r14:x}, r15: {r15:x}");
-                                ExitReason::SharedMem(
-                                    String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
-                                    r10,
-                                    r11.try_into().unwrap(),
-                                )
+                    let exc_reason = match dbg.exception {
+                        DBG_EXCEPTION_BREAKPOINT if regs.rax == NYX_LITE => UnparsedExitReason::Hypercall,
+                        DBG_EXCEPTION_BREAKPOINT if regs.rax != NYX_LITE => {
+                            let sregs = self.sregs();
+                            if self.breakpoint_manager.forward_guest_bp(sregs.cr3, regs.rip){
+                                UnparsedExitReason::GuestBreakpoint
+                            } else {
+                                UnparsedExitReason::NyxBreakpoint
                             }
-                            DBGPRINT => {
-                                ExitReason::DebugPrint(
-                                    String::from_utf8_lossy(&self.read_cstr_current(regs.r9)).to_string(),
-                                )
-                            }
-                            SNAPSHOT => ExitReason::RequestSnapshot,
-                            EXECDONE => ExitReason::ExecDone(regs.r9),
-                            _ => ExitReason::Hypercall(regs.r8, regs.r9, regs.r10, regs.r11, regs.r12),
-                        };
-                        exit = Some(hypercall)
-                    } else {
-                        exit = Some(ExitReason::Breakpoint);
-                    }
+                        }
+                        DBG_EXCEPTION_SINGLESTEP => UnparsedExitReason::SingleStep,
+                        excp => {panic!("Unexpected Debug Exception From KVM: {excp}");}
+                    };
+                    exit = Some(exc_reason)
                 }
             }
             while let Ok(ev) = self.vcpu.event_receiver.try_recv() {
                 match ev {
                     VcpuEvent::Finish => {
-                        exit = Some(ExitReason::Shutdown);
+                        exit = Some(UnparsedExitReason::Shutdown);
                     }
                     event => {
                         println!(">== recieved event: {:?}", event);
@@ -424,54 +492,65 @@ impl NyxVM {
         }
     }
 
-    pub fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>{
-        let vmm = &self.vmm.lock().unwrap();
-        let mem = vmm.guest_memory();
-        let mut res = Vec::new();
-        let mut cur_addr = guest_vaddr;
-        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
-            if !pte.present() || pte.missing_page() {
-                return res;
-            }
-            let slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
-            while cur_addr < pte.vaddrs.end {
-                let u8_char = slice.load::<u8>((cur_addr&M_PAGE_OFFSET) as usize, Ordering::Relaxed).unwrap();
-                res.push(u8_char);
-                cur_addr += 1;
-                if u8_char == 0 {
-                    return res;
-                }
-            }
+    pub fn parse_exit_reason(&self, unparsed: VMExitUserEvent) -> ExitReason{
+        match unparsed {
+            VMExitUserEvent::Hypercall => self.parse_hypercall(),
+            VMExitUserEvent::Interrupted => ExitReason::Interrupted,
+            VMExitUserEvent::Breakpoint => ExitReason::Breakpoint,
+            VMExitUserEvent::SingleStep => ExitReason::SingleStep,
+            VMExitUserEvent::Shutdown => ExitReason::Shutdown,
+            VMExitUserEvent::Timeout => ExitReason::Timeout,
         }
-        return res;
     }
+    pub fn continue_vm(&mut self, single_step: bool, timeout: Duration) -> ExitReason {
+        let unparsed = VMContinuationState::step(self, single_step, timeout);
+        return self.parse_exit_reason(unparsed);
+    }
+
+    pub fn run(&mut self, timeout: Duration) -> ExitReason {
+        let single_step = false;
+        return self.continue_vm(single_step, timeout);
+    }
+
+    pub fn single_step(&mut self, timeout: Duration) -> ExitReason{
+        let single_step = true;
+        return self.continue_vm(single_step, timeout);
+    }
+
+    pub fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
+        self.breakpoint_manager.add_breakpoint(cr3,vaddr);
+    }
+
     pub fn read_cstr_current(&self, guest_vaddr: u64) -> Vec<u8> {
         let cr3 = self.sregs().cr3;
-        self.read_virtual_cstr(cr3, guest_vaddr)
+        let vmm = self.vmm.lock().unwrap();
+        vmm.read_virtual_cstr(cr3, guest_vaddr)
     }
-
     pub fn read_current_u64(&self, vaddr: u64) -> u64 {
         let cr3 = self.sregs().cr3;
-        return self.read_virtual_u64(cr3, vaddr);
+        let vmm = self.vmm.lock().unwrap();
+        return vmm.read_virtual_u64(cr3, vaddr).unwrap();
     }
-
-    pub fn read_virtual_u64(&self, cr3: u64, vaddr: u64) -> u64 {
-        let vmm = &self.vmm.lock().unwrap();
-        let mem = vmm.guest_memory();
-        let paddr = mem::resolve_addr(mem, cr3, vaddr).unwrap();
-        return mem::read_phys_u64(mem, paddr).unwrap();
-    }
-
     pub fn write_current_u64(&self, vaddr: u64, val: u64) {
         let cr3 = self.sregs().cr3;
-        return self.write_virtual_u64(cr3, vaddr, val);
+        let vmm = self.vmm.lock().unwrap();
+        return vmm.write_virtual_u64(cr3, vaddr, val).unwrap();
     }
-    pub fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) {
-        let vmm = &self.vmm.lock().unwrap();
-        let mem = vmm.guest_memory();
-        let paddr = mem::resolve_addr(mem, cr3, vaddr).unwrap();
-        vmm.guest_memory()
-            .store(val, GuestAddress(paddr), Ordering::Relaxed)
-            .unwrap();
+
+    pub fn read_current_bytes(&self, vaddr: u64, num_bytes: usize) -> Vec<u8> {
+        let mut res = Vec::with_capacity(num_bytes);
+        let cr3 = self.sregs().cr3;
+        res.resize(num_bytes, 0);
+        let vmm = self.vmm.lock().unwrap();
+        let bytes_copied = vmm.read_virtual_bytes(cr3, vaddr, &mut res).unwrap();
+        res.truncate(bytes_copied);
+        //@TODO 
+        // It appears that we see high kernel addresses sometimes (i.e.
+        // rip = ffffffff823b1ad8 during the boot breakpoint vmexit, triggered when disassembly rip). Those aren't
+        // handled correctly right now. Investigate expected behavior
+        if vaddr < 0xffffffff00000000 {
+            assert_eq!(bytes_copied, num_bytes); 
+        }
+        return res;
     }
 }
