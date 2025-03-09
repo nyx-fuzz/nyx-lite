@@ -9,6 +9,7 @@ pub enum VMExitUserEvent {
     Hypercall,
     Timeout,
     Breakpoint,
+    HWBreakpoint(u8),
     SingleStep,
     Interrupted,
 }
@@ -46,6 +47,7 @@ impl VMContinuationState{
         vm.breakpoint_manager.enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
         let exit = vm.run_inner(timeout);
         match exit {
+            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
             UnparsedExitReason::GuestBreakpoint => return (Self::ForceSingleStepInjectBPs, None),
             UnparsedExitReason::NyxBreakpoint => return (Self::ForceSingleStep, Some(VMExitUserEvent::Breakpoint)),
             UnparsedExitReason::Hypercall => return  (Self::EmulateHypercall, Some(VMExitUserEvent::Hypercall)),
@@ -83,6 +85,7 @@ impl VMContinuationState{
                 Self::assert_made_no_progress(vm);
                 return (Self::ForceSingleStepInjectBPs, None);
             }
+            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
             UnparsedExitReason::NyxBreakpoint => {
                 //To get here, we triggered a nyx-bp at address X. Then we removed the breakpoints from that address.
                 //Singlestep shouldn't trigger the next instruction. So IF we trigger a breakpoint ad X, AFTER we
@@ -117,6 +120,7 @@ impl VMContinuationState{
                 Self::assert_made_progress(vm); 
                 return (Self::Main, None)
             }
+            UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
             UnparsedExitReason::GuestBreakpoint => {
                 panic!("We shouild never see a breakpoint based vm exit while injecting breakpoints interrupts");
             }

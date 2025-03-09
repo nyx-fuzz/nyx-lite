@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use vmm::arch::DeviceType;
-use vmm::arch_gen::x86::msr_index::{MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
+use vmm::arch_gen::x86::msr_index::{MSR_IA32_DEBUGCTLMSR, MSR_IA32_LASTBRANCHFROMIP, MSR_IA32_LASTBRANCHTOIP, MSR_IA32_LASTINTFROMIP, MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST, MSR_LBR_TOS};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
@@ -30,7 +30,7 @@ use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, FcExitCode, VcpuEvent};
 
-use kvm_bindings::{kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_INJECT_BP};
+use kvm_bindings::{kvm_guest_debug_arch, kvm_msr_entry, kvm_regs, kvm_sregs, Msrs, KVM_GUESTDBG_BLOCKIRQ, KVM_GUESTDBG_INJECT_BP, KVM_GUESTDBG_USE_HW_BP};
 use kvm_bindings::kvm_guest_debug;
 use kvm_bindings::KVM_GUESTDBG_ENABLE;
 use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
@@ -38,6 +38,7 @@ use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 
 use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
 use crate::firecracker_wrappers::build_microvm_for_boot;
+use crate::hw_breakpoints::HwBreakpoints;
 use crate::timer_event::TimerEvent;
 use crate::vm_continuation_statemachine::{VMExitUserEvent, VMContinuationState};
 use crate::mem::{self, NyxMemExtension};
@@ -56,6 +57,11 @@ const SHAREMEM: u64 = 0x6d656d6572616873;
 const DBGPRINT: u64 = 0x746e697270676264;
 const DBG_EXCEPTION_BREAKPOINT : u32 = 3;
 const DBG_EXCEPTION_SINGLESTEP : u32 = 1;
+const DR6_BS : u64 = 1<<14 ; // Single-Step execution
+const DR6_HWBP_0: u64 = 1 << 0;
+const DR6_HWBP_1: u64 = 1 << 1;
+const DR6_HWBP_2: u64 = 1 << 2;
+const DR6_HWBP_3: u64 = 1 << 3;
 pub struct NyxVM {
     pub vmm: Arc<Mutex<Vmm>>,
     pub vcpu: Vcpu,
@@ -65,6 +71,7 @@ pub struct NyxVM {
     pub timeout_timer: Arc<Mutex<TimerEvent>>,
     pub continuation_state: VMContinuationState,
     pub breakpoint_manager: Box<dyn BreakpointManagerTrait>,
+    pub hw_breakpoints: HwBreakpoints,
 }
 
 pub struct BlockDeviceSnapshot {
@@ -106,6 +113,7 @@ pub enum UnparsedExitReason {
     GuestBreakpoint,
     SingleStep,
     Interrupted,
+    HWBreakpoint(u8),
 }
 
 #[derive(Debug)]
@@ -118,6 +126,7 @@ pub enum ExitReason {
     DebugPrint(String),
     Timeout,
     Breakpoint,
+    HWBreakpoint(u8),
     SingleStep,
     Interrupted,
 }
@@ -162,8 +171,12 @@ impl NyxVM {
         
         let timeout_timer = Arc::new(Mutex::new(TimerEvent::new()));
         event_manager.add_subscriber(timeout_timer.clone());
-	// This will allow the timeout timer to send the signal that makes KVM exit immediatly
+        // This will allow the timeout timer to send the signal that makes KVM exit immediatly
         Vcpu::register_kick_signal_handler();
+        // Make the event thread that epolls all the event fd & calls their callbacks.
+        // Note: we want to move as many things as possible away from this, as
+        // the async nature of it messes with, snapshot & reproducibility of
+        // executions
         let t_vmm = Arc::clone(&vmm);
         let event_thread_handle = thread::Builder::new()
             .name("event_thread".to_string())
@@ -193,6 +206,7 @@ impl NyxVM {
             timeout_timer,
             continuation_state: VMContinuationState::Main,
             breakpoint_manager: Box::new(BreakpointManager::new()),
+            hw_breakpoints: HwBreakpoints::new(),
         };
     }
 
@@ -390,11 +404,19 @@ impl NyxVM {
             control |= KVM_GUESTDBG_BLOCKIRQ;
         };
         control |= if vmexit_on_swbp {KVM_GUESTDBG_USE_SW_BP} else {KVM_GUESTDBG_INJECT_BP};
+        let mut arch  = kvm_guest_debug_arch::default();
+        if self.hw_breakpoints.any_active() {
+            control |= KVM_GUESTDBG_USE_HW_BP;
+            arch.debugreg[0] = self.hw_breakpoints.addr(0);
+            arch.debugreg[1] = self.hw_breakpoints.addr(1);
+            arch.debugreg[2] = self.hw_breakpoints.addr(2);
+            arch.debugreg[3] = self.hw_breakpoints.addr(3);
+            arch.debugreg[7] = self.hw_breakpoints.compute_dr7();
+        }
         let dbg_info = kvm_guest_debug {
             control,
             pad: 0,
-            // Reset all arch-specific debug registers
-            arch: Default::default(),
+            arch
         };
         self.vcpu.kvm_vcpu.fd.set_guest_debug(&dbg_info).unwrap();
     }
@@ -465,8 +487,13 @@ impl NyxVM {
                                 UnparsedExitReason::NyxBreakpoint
                             }
                         }
-                        DBG_EXCEPTION_SINGLESTEP => UnparsedExitReason::SingleStep,
-                        excp => {panic!("Unexpected Debug Exception From KVM: {excp}");}
+                        DBG_EXCEPTION_SINGLESTEP if (dbg.dr6 & DR6_BS)     != 0 =>  UnparsedExitReason::SingleStep,
+                        DBG_EXCEPTION_SINGLESTEP if (dbg.dr6 & DR6_HWBP_0) != 0 =>  UnparsedExitReason::HWBreakpoint(0),
+                        DBG_EXCEPTION_SINGLESTEP if (dbg.dr6 & DR6_HWBP_1) != 0 =>  UnparsedExitReason::HWBreakpoint(1),
+                        DBG_EXCEPTION_SINGLESTEP if (dbg.dr6 & DR6_HWBP_2) != 0 =>  UnparsedExitReason::HWBreakpoint(2),
+                        DBG_EXCEPTION_SINGLESTEP if (dbg.dr6 & DR6_HWBP_3) != 0 =>  UnparsedExitReason::HWBreakpoint(3),
+
+                        excp => {panic!("Unexpected Debug Exception From KVM: {excp} {:x?} ", dbg);}
                     };
                     exit = Some(exc_reason)
                 }
@@ -496,6 +523,7 @@ impl NyxVM {
             VMExitUserEvent::SingleStep => ExitReason::SingleStep,
             VMExitUserEvent::Shutdown => ExitReason::Shutdown,
             VMExitUserEvent::Timeout => ExitReason::Timeout,
+            VMExitUserEvent::HWBreakpoint(x) => ExitReason::HWBreakpoint(x),
         }
     }
     pub fn continue_vm(&mut self, single_step: bool, timeout: Duration) -> ExitReason {
@@ -515,6 +543,10 @@ impl NyxVM {
 
     pub fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
         self.breakpoint_manager.add_breakpoint(cr3,vaddr);
+    }
+
+    pub fn remove_all_breakpoints(&mut self){
+        self.breakpoint_manager.remove_all_breakpoints();
     }
 
     pub fn read_cstr_current(&self, guest_vaddr: u64) -> Vec<u8> {
@@ -549,4 +581,75 @@ impl NyxVM {
         }
         return res;
     }
+
+    fn set_lbr(&mut self) {
+        panic!("reading lbr doesn't seem to be supported by KVM");
+        //let msrs_to_set = [
+        //    kvm_msr_entry {
+        //        index: MSR_IA32_DEBUGCTLMSR,
+        //        data: 1,
+        //        ..Default::default()
+        //    },
+        //];
+        //let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        //let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
+        //assert_eq!(num_set, msrs_to_set.len());
+    }
+
+    fn get_lbr(&mut self){
+        panic!("None of this seems supported by KVM?");
+        // it appears XSAVE nees AI32_XSS[15] to actually store LBR data, and we can't set AI32_XSS via kvm.
+        // let xsave = self.vcpu.kvm_vcpu.fd.get_xsave().unwrap();
+        // println!("got xsave: {:x?}",xsave);
+        //
+        // this is all even more broken. All of this only applies to AMD cpus:
+        ////let lbr_tos = self.vcpu.kvm_vcpu.get_msrs(&[MSR_LBR_TOS]).unwrap()[&0];
+        // let msrs_to_set = [
+        //     kvm_msr_entry {
+        //         index: 0x00000680,
+        //         data: 1,
+        //         ..Default::default()
+        //     },
+        // ];
+        // let mut msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        // let lbr_tos = self.vcpu.kvm_vcpu.fd.get_msrs(&mut msrs_wrapper).unwrap();
+        // assert_eq!(lbr_tos, 1);
+        // msrs_wrapper.as_slice().iter().for_each(|msr| {
+        //     println!("got MSR_IA32_DEBUGCTLMSR: {}, {:?} {:?}", lbr_tos, msr.index, msr.data);
+        // });
+        ////let mut lbr_stack = Vec::with_capacity(32);
+        //
+        //for i in 0..32 {
+        //    let msrs_to_set = [
+        //        kvm_msr_entry {
+        //            index: MSR_IA32_LASTBRANCHFROMIP+i,
+        //            data: 1338,
+        //            ..Default::default()
+        //        },
+        //        kvm_msr_entry {
+        //            index: MSR_IA32_LASTBRANCHTOIP+i,
+        //            data: 1339,
+        //            ..Default::default()
+        //        },
+        //        kvm_msr_entry {
+        //            index: MSR_LBR_TOS,
+        //            data: 1337,
+        //            ..Default::default()
+        //        },
+        //    ];
+        //    let mut msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+        //    let lbr_tos = self.vcpu.kvm_vcpu.fd.get_msrs(&mut msrs_wrapper).unwrap();
+        //    assert_eq!(lbr_tos, 3);
+        //    msrs_wrapper.as_slice().iter().for_each(|msr| {
+        //        println!("got MSR_IA#@_LASTBRANCHTOIP: {}, {:?} {:?}", lbr_tos, msr.index, msr.data);
+        //    });
+        //    //lbr_stack.push((
+        //    //    self.vcpu.kvm_vcpu.get_msrs(&[MSR_IA32_LASTINTFROMIP+i]).unwrap()[&0],
+        //    //    self.vcpu.kvm_vcpu.get_msrs(&[MSR_IA32_LASTBRANCHTOIP+i]).unwrap()[&0],
+        //    //));
+        //}
+        ////println!("LBR: {:x?} top: {:?}", lbr_stack, lbr_tos);
+    }
+
+
 }

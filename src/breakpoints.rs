@@ -23,6 +23,8 @@ pub trait BreakpointManagerTrait{
     fn disable_all_breakpoints(&mut self, vmm: &mut Vmm);
     fn enable_all_breakpoints(&mut self, vmm: &mut Vmm);
     fn add_breakpoint(&mut self, cr3: u64, vaddr: u64);
+    fn remove_breakpoint(&mut self, cr3: u64, vaddr: u64);
+    fn remove_all_breakpoints(&mut self);
 
     fn forward_guest_bp(&self, cr3: u64, rip: u64) -> bool {
         return !self.known_breakpoint(cr3, rip);
@@ -59,5 +61,12 @@ impl BreakpointManagerTrait for BreakpointManager{
     fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
         let breakpoint = Breakpoint::new(cr3, vaddr);
         self.breakpoints.insert((cr3,vaddr), breakpoint);
+    }
+
+    fn remove_breakpoint(&mut self, cr3: u64, vaddr: u64) {
+        self.breakpoints.remove(&(cr3,vaddr));
+    }
+    fn remove_all_breakpoints(&mut self) {
+       self.breakpoints.clear(); 
     }
 }

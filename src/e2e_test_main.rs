@@ -18,6 +18,7 @@ use anyhow::Result;
 
 use libc::{pthread_t, SIGSTOP};
 use nyx_lite::disassembly::disassemble_print;
+use nyx_lite::hw_breakpoints::{HwBreakpointMode, HwBreakpoints};
 use nyx_lite::vm_continuation_statemachine::VMContinuationState;
 use nyx_lite::{BaseSnapshot, ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
@@ -137,12 +138,16 @@ fn main_exec() -> Result<()> {
     test_subprocess(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure filesystem state is reset");
     test_filesystem_reset(&mut vm, shared_vaddr, &snapshot);
-    info!("TEST: Ensure debug facilities work");
+    info!("TEST: Ensure single steping works");
     test_single_step(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure host bps are returned as exits");
     test_host_bp(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure host code hw-bps are returned as exits");
+    test_host_hw_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure guest bp are injected properly");
     test_guest_bp(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure we can use hardware breakpoints for memory accesses");
+    test_mem_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure VM shuts down cleanly");
     test_shutdown(&mut vm, shared_vaddr, &snapshot);
     info!("RAN ALL TESTS SUCCESSFULLY");
@@ -326,7 +331,6 @@ pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsh
     // add rax,2     # 48 83 c0 02 
     // add rax,3     # 48 83 c0 03
     // add rax,4     # 48 83 c0 04
-    println!("single stepping from code addr {}",code_addr);
     let exit_reason = vm.single_step(Duration::from_millis(10));
     match exit_reason {
         ExitReason::SingleStep => {/* EXPECTED */},
@@ -358,7 +362,7 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
 
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: test get to known code for host bps");
+    let exit_reason = run_vm_test(vm, 100, "test_host_bp: test get to known code for host bps");
     let (cr3, code_addr) = match exit_reason {
         ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -378,10 +382,11 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     // +12 add rax,2     # 48 83 c0 02 
     // +16 add rax,3     # 48 83 c0 03 *BP
     // +20 add rax,4     # 48 83 c0 04 *BP
-    disassemble_print(code_addr, &vm.read_current_bytes(code_addr, 24));
+    //disassemble_print(code_addr, &vm.read_current_bytes(code_addr, 24));
     vm.add_breakpoint(cr3, code_addr+8); // breakpoint `add rax,1`
     vm.add_breakpoint(cr3, code_addr+16); // breakpoint `add rax,3`
     vm.add_breakpoint(cr3, code_addr+20); // breakpoint `add rax,4`
+
     let exit_reason = run_vm_test(vm, 100, "test_host_bp: test get to next bps");
     match exit_reason {
         ExitReason::Breakpoint => assert_eq!(vm.regs().rip, code_addr+8),
@@ -476,6 +481,54 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
         ExitReason::Breakpoint => assert_eq!(vm.regs().rip, code_addr+16),
         _ => { panic!("unexpected exit {exit_reason:?}"); }
     };
+    vm.remove_all_breakpoints();
+}
+
+pub fn test_host_hw_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+7);
+
+    let exit_reason = run_vm_test(vm, 100, "test_host_hw_bp: test get to known code for host bps");
+    let (cr3, code_addr) = match exit_reason {
+        ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 3366, "expect dbgcode 3366");
+            let cr3 = vm.sregs().cr3;
+            let code_addr = vm.regs().rip;
+            (cr3, code_addr)
+        },
+        _ => {
+            panic!("unexpected exit {exit_reason:?}");
+        }
+    };
+    // Code after the DBG_CODE hypercall is:
+    // +00 int 3         # cc <- rip is here
+    // +01 mov rax,1234  # 48 c7 c0 d2 04 00 00
+    // +08 add rax,1     # 48 83 c0 01 *BP
+    // +12 add rax,2     # 48 83 c0 02 
+    // +16 add rax,3     # 48 83 c0 03 *BP
+    // +20 add rax,4     # 48 83 c0 04 *BP
+    //disassemble_print(code_addr, &vm.read_current_bytes(code_addr, 24));
+    vm.hw_breakpoints.enable_exec(0, code_addr+8);
+    vm.hw_breakpoints.enable_exec(1, code_addr+16);
+    vm.hw_breakpoints.enable_exec(2, code_addr+20);
+    let exit_reason = run_vm_test(vm, 100, "test_host_hw_bp: test get to next bps");
+    match exit_reason {
+        ExitReason::HWBreakpoint(0) => assert_eq!(vm.regs().rip, code_addr+8),
+        _ => panic!("unexpected exit {exit_reason:?}"),
+    };
+    vm.hw_breakpoints.disable(0);
+    let exit_reason = run_vm_test(vm, 100, "test_host_hw_bp: test get to next bps");
+    match exit_reason {
+        ExitReason::HWBreakpoint(1) => assert_eq!(vm.regs().rip, code_addr+16),
+        _ => panic!("unexpected exit {exit_reason:?}"),
+    };
+    vm.hw_breakpoints.disable(1);
+    let exit_reason = run_vm_test(vm, 100, "test_host_hw_bp: test get to next bps");
+    match exit_reason {
+        ExitReason::HWBreakpoint(2) => assert_eq!(vm.regs().rip, code_addr+20),
+        _ => panic!("unexpected exit {exit_reason:?}"),
+    };
 }
 
 pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
@@ -502,6 +555,52 @@ pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot)
         _ => {
             panic!("unexpected exit {exit_reason:?}");
         }
+    };
+}
+
+pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+9); // subprocess will do a bunch of branches
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: trying to get guest pointer");
+    let (offset, data) = match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            (arg1, arg2)
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.hw_breakpoints.enable_access(0, data+0x1000*8, 8);
+    vm.write_current_u64(offset, 0x1000); // access data + 0x1000
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    match exit_reason {
+        ExitReason::HWBreakpoint(0) => {},
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.hw_breakpoints.disable(0);
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 0);
+            assert_eq!(arg2, 42);
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.hw_breakpoints.enable_access(1, data+0x1000*8, 8);
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    match exit_reason {
+        ExitReason::HWBreakpoint(1) => {},
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.hw_breakpoints.disable(1);
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 1);
+            assert_eq!(arg2, 0);
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
     };
 }
 
