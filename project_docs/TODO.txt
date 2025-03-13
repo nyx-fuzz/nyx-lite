@@ -1,49 +1,37 @@
 PRE RELEASE:
-* proper memory api
-  * Process Memory Abstraction
-  * Api that returns shared pages to process memory
-  * Allow to not reset shared pages
-  * Add testing
-  * make a generic Reader/Writer implementation for virtual memory
 * documentation
   * a minimal fuzzing example
   * cleaning up lint errors
   * comments on the actual api
 
-* Simulating EPT based memory breakpoints by host mprotect
-* explore memory breakpoints:
-  4.33 KVM_GET_DEBUGREGS
+* proper memory api (p1)
+  * Process Memory Abstraction
+  * Api that returns shared pages to process memory
+  * Allow to not reset shared pages
+  * Add testing
+  * make a generic Reader/Writer implementation for virtual memory
+Debug APIs:
+  * Simulating EPT based memory breakpoints by host mprotect (can crash when device emulation accesses this memory, slow on vmexits)
+  * Inject Mapping / Inject Code
+  * Explore DS /BTS Branch Trace Storage via MSR_IA32_DEBUGCTLMSR
+Better Memory management
+  * Use userfault_fd / signals to allow to have both EPT based breakpoints & shared root snapshots
+  * Reduce unnecessary memory by making root snapshot shared between VMs 
+Incremental snapshots  (p1)
+  * snapshot tree api
+Loading VMs
+  * fix add api to load dockerfiles directly
+  * investigate mke2fs to turn docker image into fs image
+  * fix api to load a rootdir based fs directly, rather than going through
+    docker first
 
-  Capability: KVM_CAP_DEBUGREGS
-  Architectures: x86
-  Type: vm ioctl
-  Parameters: struct kvm_debugregs (out)
-  Returns: 0 on success, -1 on error
-
-  Reads debug registers from the vcpu.
-
-  struct kvm_debugregs {
-    __u64 db[4];
-    __u64 dr6;
-    __u64 dr7;
-    __u64 flags;
-    __u64 reserved[9];
-  };
-  4.34 KVM_SET_DEBUGREGS
-* explore setting LBR via XCR
-* speed up breakpoints by not enabling/disabling them ALL the time.
-* ensure snapshot reset fixes VM shutdown
-* make it so that changing IP resets vm.continuation state as appropriate
-* make regs() and sregs() not read the register for every call
-* fix console output by redirect serial into a ptty
-* fix incremental snapshots 
-* snapshot tree api
-* fix add api to load dockerfiles directly
-* investigate mke2fs to turn docker image into fs image
-* fix api to load a rootdir based fs directly, rather than going through
-  docker first
-* fix safe memory by allowing root snapshot sharing between processes 
-* profiling snapshot performance 
+bugfixes:
+* fix BTF Branch Based single step via MSR_IA32_DEBUGCTLMSR
 * fix kvm dirty ring api to speed up snapshots
 * fix host atomic bitmap to speed up snapshots
 * fix nested virtualization
+* fix console output by redirect serial into a ptty
+* ensure snapshot reset fixes VM shutdown
+* make it so that changing IP resets vm.continuation state as appropriate
+* make regs() and sregs() not read the register for every call
+* speed up breakpoints by not enabling/disabling them ALL the time.

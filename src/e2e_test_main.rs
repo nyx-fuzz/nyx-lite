@@ -140,6 +140,8 @@ fn main_exec() -> Result<()> {
     test_filesystem_reset(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure single steping works");
     test_single_step(&mut vm, shared_vaddr, &snapshot);
+    //info!("TEST: Ensure branch steping works");
+    //test_branch_step(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure host bps are returned as exits");
     test_host_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure host code hw-bps are returned as exits");
@@ -311,7 +313,7 @@ pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseS
 pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: test get to known code for singlestep");
+    let exit_reason = run_vm_test(vm, 100, "test_single_step: test get to known code for singlestep");
     let (cr3, code_addr) = match exit_reason {
         ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -357,6 +359,57 @@ pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsh
     assert_eq!(vm.regs().rax, 1237);
     assert_eq!(vm.regs().rip, code_addr + 1+ 7 + 2*4); // 1+ 7 + 2*4 = sizeof(int 3) + sizeof(mov rax,1234) + 2*sizeof(add rax,1)
 }
+
+/*
+pub fn test_branch_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+10);
+    let exit_reason = run_vm_test(vm, 100, "test_single_step_branch: test code for singlestep in branch mode");
+    let (cr3, code_addr) = match exit_reason {
+        ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 3366, "expect dbgcode 3366");
+            let cr3 = vm.sregs().cr3;
+            let code_addr = vm.regs().rip;
+            (cr3, code_addr)
+        },
+        _ => {
+            panic!("unexpected exit {exit_reason:?}");
+        }
+    };
+
+    // disassemble_print(code_addr, &vm.read_current_bytes(code_addr, 128));
+    // + 0 CC                  int3
+    // + 1 48C7C0D2040000      mov       rax,4D2h
+    // + 8 49C7C300000000      mov       r11,0
+    // +15 4983FA2A            cmp       r10,2Ah
+    // +19 7402                je        +21
+    // +21 EB11                jmp       +40
+    // +23 49C7C301000000      mov       r11,1
+    // +30 4983FA64            cmp       r10,64h
+    // +34 7D04                jge       +40
+    // +36 4983C301            add       r11,1
+    // +40 E96D060000          jmp       ...
+
+    let exit_reason = vm.branch_step(Duration::from_millis(10));
+    match exit_reason {
+        ExitReason::SingleStep => {/* EXPECTED */},
+        _ => { panic!("unexpected exit {exit_reason:?}"); }
+    };
+    assert_eq!(cr3, vm.sregs().cr3, "cr3 changed during singlestep");
+    assert_eq!(vm.regs().rax, 1234);
+    assert_eq!(vm.regs().rip, code_addr + 1 + 7); // 1 = sizeof(int 3), 7 = sizeof(mov rax,1234)
+
+    let exit_reason = vm.branch_step(Duration::from_millis(10));
+    match exit_reason {
+        ExitReason::SingleStep => {/* EXPECTED */},
+        _ => { panic!("unexpected exit {exit_reason:?}"); }
+    };
+    // note this test sometimes fails for some reason
+    assert_eq!(cr3, vm.sregs().cr3, "cr3 changed during singlestep");
+    assert_eq!(vm.regs().rax, 1234);
+    assert_eq!(vm.regs().rip, code_addr + 15); 
+} */
 
 pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     vm.apply_snapshot(snapshot);

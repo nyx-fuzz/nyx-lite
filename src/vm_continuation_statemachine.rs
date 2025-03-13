@@ -22,13 +22,30 @@ pub enum VMContinuationState{
     ForceSingleStepInjectBPs,
 }
 
+#[derive(Clone,Copy,Debug,Eq, PartialEq, Hash)]
+pub enum RunMode{
+    Run,
+    SingleStep,
+    BranchStep
+}
+
+impl RunMode{
+    pub fn is_step(&self) -> bool {
+        match self {
+            RunMode::Run => false,
+            RunMode::SingleStep => true,
+            RunMode::BranchStep => true,
+        }
+    }
+}
+
 impl VMContinuationState{
-    pub fn step(vm: &mut NyxVM, single_step:bool, timeout: Duration) -> VMExitUserEvent{
+    pub fn step(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> VMExitUserEvent{
         loop{
             //println!("LOOP {:?} requested singlestep {}", vm.continuation_state, single_step);
             let (new_state,res) = match vm.continuation_state{
-                Self::Main => Self::run_main(vm, single_step, timeout),
-                Self::ForceSingleStep => Self::force_ss(vm, single_step),
+                Self::Main => Self::run_main(vm, run_mode, timeout),
+                Self::ForceSingleStep => Self::force_ss(vm, run_mode.is_step()),
                 Self::ForceSingleStepInjectBPs => Self::force_ss_inject_bps(vm),
                 Self::EmulateHypercall => Self::emulate_hypercall(vm),
             };
@@ -40,10 +57,10 @@ impl VMContinuationState{
         }
     }
 
-    fn run_main(vm: &mut NyxVM, single_step:bool, timeout: Duration) -> (Self, Option<VMExitUserEvent>){
+    fn run_main(vm: &mut NyxVM, run_mode: RunMode, timeout: Duration) -> (Self, Option<VMExitUserEvent>){
         let vmexit_on_swbp = true;
         //vm.reapply_skipped_bps(); TODO add this once we actually support breakpoints
-        vm.set_debug_state(single_step, vmexit_on_swbp);
+        vm.set_debug_state(run_mode, vmexit_on_swbp);
         vm.breakpoint_manager.enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
         let exit = vm.run_inner(timeout);
         match exit {
@@ -54,7 +71,7 @@ impl VMContinuationState{
             UnparsedExitReason::Interrupted => return (Self::Main, None),
             UnparsedExitReason::Shutdown => return (Self::Main, Some(VMExitUserEvent::Shutdown)),
             UnparsedExitReason::SingleStep => {
-                if single_step { 
+                if run_mode.is_step() { 
                     return (Self::Main, Some(VMExitUserEvent::SingleStep))
                 }
                 panic!("We shouldn't see singlestep exceptions unless we asked for them");
@@ -63,9 +80,8 @@ impl VMContinuationState{
         };
     }
     fn force_ss(vm: &mut NyxVM, user_requested_singlestep: bool) -> (Self,Option<VMExitUserEvent>){
-        let single_step = true;
         let vmexit_on_swbp = true;
-        vm.set_debug_state(single_step, vmexit_on_swbp);
+        vm.set_debug_state(RunMode::SingleStep, vmexit_on_swbp);
         vm.breakpoint_manager.disable_all_breakpoints(&mut vm.vmm.lock().unwrap()); // step over the breakpoint(s)
         let no_timeout = Duration::MAX;
         let exit = vm.run_inner(no_timeout);
@@ -107,9 +123,8 @@ impl VMContinuationState{
 
 
     fn force_ss_inject_bps(vm: &mut NyxVM) -> (Self,Option<VMExitUserEvent>){
-        let single_step = true;
         let vmexit_on_swbp = false;
-        vm.set_debug_state(single_step, vmexit_on_swbp);
+        vm.set_debug_state(RunMode::SingleStep, vmexit_on_swbp);
         vm.breakpoint_manager.disable_all_breakpoints(&mut vm.vmm.lock().unwrap()); // step over nyx breakpoint(s), but not guest breakpoints
         let no_timeout = Duration::MAX;
         let exit = vm.run_inner(no_timeout);

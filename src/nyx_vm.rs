@@ -40,7 +40,7 @@ use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::hw_breakpoints::HwBreakpoints;
 use crate::timer_event::TimerEvent;
-use crate::vm_continuation_statemachine::{VMExitUserEvent, VMContinuationState};
+use crate::vm_continuation_statemachine::{RunMode, VMContinuationState, VMExitUserEvent};
 use crate::mem::{self, NyxMemExtension};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -397,12 +397,26 @@ impl NyxVM {
         self.vcpu.kvm_vcpu.fd.set_regs(regs).unwrap();
     }
 
-    pub fn set_debug_state(&mut self, single_step: bool, vmexit_on_swbp: bool ){
+    pub fn set_debug_state(&mut self, run_mode: RunMode, vmexit_on_swbp: bool ){
         let mut control = KVM_GUESTDBG_ENABLE;
-        if single_step {
+        if run_mode.is_step() {
             control |= KVM_GUESTDBG_SINGLESTEP;
             control |= KVM_GUESTDBG_BLOCKIRQ;
         };
+        if let RunMode::BranchStep = run_mode{
+            // It seems KVM completely ignores BTF bit - need to figure out why.
+            const BTF :usize = 1; // BTF is bit 1 in IA32_DEBUGCTLMSR
+            let msrs_to_set = [
+                kvm_msr_entry {
+                    index: MSR_IA32_DEBUGCTLMSR,
+                    data: 1<<BTF,
+                    ..Default::default()
+                },
+            ];
+            let msrs_wrapper = Msrs::from_entries(&msrs_to_set).unwrap();
+            let num_set = self.vcpu.kvm_vcpu.fd.set_msrs(&msrs_wrapper).unwrap();
+            assert_eq!(num_set,1);
+        }
         control |= if vmexit_on_swbp {KVM_GUESTDBG_USE_SW_BP} else {KVM_GUESTDBG_INJECT_BP};
         let mut arch  = kvm_guest_debug_arch::default();
         if self.hw_breakpoints.any_active() {
@@ -424,10 +438,6 @@ impl NyxVM {
     pub fn is_nyx_hypercall(&self) -> bool {
         let regs = self.regs();
         return regs.rax == NYX_LITE;
-    }
-
-    pub fn is_nyx_swbp(&mut self) -> bool {
-        return false;
     }
 
     pub fn parse_hypercall(&self) -> ExitReason{
@@ -526,19 +536,24 @@ impl NyxVM {
             VMExitUserEvent::HWBreakpoint(x) => ExitReason::HWBreakpoint(x),
         }
     }
-    pub fn continue_vm(&mut self, single_step: bool, timeout: Duration) -> ExitReason {
-        let unparsed = VMContinuationState::step(self, single_step, timeout);
+    pub fn continue_vm(&mut self, run_mode: RunMode, timeout: Duration) -> ExitReason {
+        let unparsed = VMContinuationState::step(self, run_mode, timeout);
         return self.parse_exit_reason(unparsed);
     }
 
     pub fn run(&mut self, timeout: Duration) -> ExitReason {
-        let single_step = false;
-        return self.continue_vm(single_step, timeout);
+        return self.continue_vm(RunMode::Run, timeout);
     }
 
     pub fn single_step(&mut self, timeout: Duration) -> ExitReason{
-        let single_step = true;
-        return self.continue_vm(single_step, timeout);
+        return self.continue_vm(RunMode::SingleStep, timeout);
+    }
+
+    pub fn branch_step(&mut self, timeout: Duration) -> ExitReason{
+        panic!("access to MSRs is currently not working as expected")
+        // https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/pmu_intel.c
+        // TODO figure out how fix this
+        // return self.continue_vm(RunMode::BranchStep, timeout);
     }
 
     pub fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
