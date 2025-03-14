@@ -11,14 +11,13 @@ use std::fs::{self};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use libc::{pthread_t, SIGSTOP};
-use nyx_lite::disassembly::disassemble_print;
-use nyx_lite::hw_breakpoints::{HwBreakpointMode, HwBreakpoints};
+use nyx_lite::disassembly::{self, disassemble_print};
+use nyx_lite::mem::{NyxMemExtension, PagePermission};
 use nyx_lite::vm_continuation_statemachine::VMContinuationState;
 use nyx_lite::{BaseSnapshot, ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
@@ -150,6 +149,8 @@ fn main_exec() -> Result<()> {
     test_guest_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure we can use hardware breakpoints for memory accesses");
     test_mem_bp(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure we trigger vm exits by mprotect");
+    test_mem_permissions(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure VM shuts down cleanly");
     test_shutdown(&mut vm, shared_vaddr, &snapshot);
     info!("RAN ALL TESTS SUCCESSFULLY");
@@ -542,13 +543,12 @@ pub fn test_host_hw_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsho
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
 
     let exit_reason = run_vm_test(vm, 100, "test_host_hw_bp: test get to known code for host bps");
-    let (cr3, code_addr) = match exit_reason {
+    let code_addr = match exit_reason {
         ExitReason::Hypercall(num, arg1, _arg2, _arg3, _arg4) => {
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
             assert_eq!(arg1, 3366, "expect dbgcode 3366");
-            let cr3 = vm.sregs().cr3;
             let code_addr = vm.regs().rip;
-            (cr3, code_addr)
+            code_addr
         },
         _ => {
             panic!("unexpected exit {exit_reason:?}");
@@ -613,8 +613,8 @@ pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot)
 
 pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     vm.apply_snapshot(snapshot);
-    vm.write_current_u64(shared_vaddr, TEST_NUM+9); // subprocess will do a bunch of branches
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: trying to get guest pointer");
+    vm.write_current_u64(shared_vaddr, TEST_NUM+9); 
+    let exit_reason = run_vm_test(vm, 100, "test_mem_bp: trying to get guest pointer");
     let (offset, data) = match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -624,13 +624,13 @@ pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     };
     vm.hw_breakpoints.enable_access(0, data+0x1000*8, 8);
     vm.write_current_u64(offset, 0x1000); // access data + 0x1000
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_bp: read offset");
     match exit_reason {
         ExitReason::HWBreakpoint(0) => {},
         _ => panic!("unexpected exit {exit_reason:?}")
     };
     vm.hw_breakpoints.disable(0);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_bp: read offset");
     match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -640,12 +640,58 @@ pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
         _ => panic!("unexpected exit {exit_reason:?}")
     };
     vm.hw_breakpoints.enable_access(1, data+0x1000*8, 8);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_bp: write offset");
     match exit_reason {
         ExitReason::HWBreakpoint(1) => {},
         _ => panic!("unexpected exit {exit_reason:?}")
     };
     vm.hw_breakpoints.disable(1);
+    let exit_reason = run_vm_test(vm, 100, "test_mem_bp: write offset");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 1);
+            assert_eq!(arg2, 0);
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+}
+pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+    vm.apply_snapshot(snapshot);
+    vm.write_current_u64(shared_vaddr, TEST_NUM+9); // subprocess will do a bunch of branches
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: trying to get guest pointer");
+    let (offset, data) = match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            (arg1, arg2)
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+
+    let cr3 = vm.sregs().cr3;
+    vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::None);
+    vm.write_current_u64(offset, 0x1000); // access data + 0x1000
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    match exit_reason {
+        ExitReason::BadMemoryAccess(vec) => {assert_eq!(vec, [(data+0x1000*8, disassembly::OpAccess::Read)])},
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::R);
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    match exit_reason {
+        ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+            assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+            assert_eq!(arg1, 0);
+            assert_eq!(arg2, 42);
+        },
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    match exit_reason {
+        ExitReason::BadMemoryAccess(vec) => {assert_eq!(vec, [(data+0x1000*8, disassembly::OpAccess::Write)])},
+        _ => panic!("unexpected exit {exit_reason:?}")
+    };
+    vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::RW);
     let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
     match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
@@ -656,6 +702,7 @@ pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
         _ => panic!("unexpected exit {exit_reason:?}")
     };
 }
+
 
 
 pub fn test_shutdown(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {

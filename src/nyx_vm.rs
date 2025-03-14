@@ -7,8 +7,9 @@ use std::thread;
 use anyhow::Result;
 
 use event_manager::SubscriberOps;
+use iced_x86::OpAccess;
 use vmm::arch::DeviceType;
-use vmm::arch_gen::x86::msr_index::{MSR_IA32_DEBUGCTLMSR, MSR_IA32_LASTBRANCHFROMIP, MSR_IA32_LASTBRANCHTOIP, MSR_IA32_LASTINTFROMIP, MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST, MSR_LBR_TOS};
+use vmm::arch_gen::x86::msr_index::{MSR_IA32_DEBUGCTLMSR, MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
@@ -25,7 +26,7 @@ use vmm::vstate::memory::GuestMemoryExtension;
 use vmm::vstate::memory::{
     Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress,
 };
-use vmm::vstate::vcpu::VcpuEmulation;
+use vmm::vstate::vcpu::{VcpuEmulation, VcpuError};
 use vmm::Vcpu;
 use vmm::Vmm;
 use vmm::{EventManager, FcExitCode, VcpuEvent};
@@ -37,6 +38,7 @@ use kvm_bindings::KVM_GUESTDBG_USE_SW_BP;
 use kvm_bindings::KVM_GUESTDBG_SINGLESTEP;
 
 use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
+use crate::disassembly::disassemble_memory_accesses;
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::hw_breakpoints::HwBreakpoints;
 use crate::timer_event::TimerEvent;
@@ -49,7 +51,6 @@ pub enum DebugState{
     SingleStep,
     Continue,
 }
-
 const EXECDONE: u64 = 0x656e6f6463657865;
 const SNAPSHOT: u64 = 0x746f687370616e73;
 const NYX_LITE: u64 = 0x6574696c2d78796e;
@@ -114,12 +115,14 @@ pub enum UnparsedExitReason {
     SingleStep,
     Interrupted,
     HWBreakpoint(u8),
+    BadMemoryAccess,
 }
 
 #[derive(Debug)]
 pub enum ExitReason {
     Shutdown,
     Hypercall(u64, u64, u64, u64, u64),
+    BadMemoryAccess(Vec<(u64, OpAccess)>),
     RequestSnapshot,
     ExecDone(u64),
     SharedMem(String, u64, usize),
@@ -465,16 +468,24 @@ impl NyxVM {
         panic!("Don't call parse_hypercall on a non-hypercall vmexit!");
     }
 
+    pub fn parse_bad_memory_access(&self) -> ExitReason {
+        let regs = self.regs();
+        let sregs = self.sregs();
+        let data = self.read_current_bytes(regs.rip, 16);
+        let accesses = disassemble_memory_accesses(&data, &regs, &sregs);
+        return ExitReason::BadMemoryAccess(accesses);
+    }
+
     pub fn run_inner(&mut self, timeout: Duration) -> UnparsedExitReason{
         let start_time = time::Instant::now();
         self.timeout_timer.lock().unwrap().set_timeout(timeout);
         loop {
             let mut exit = None;
-            match self.vcpu.run_emulation().unwrap() {
+            match self.vcpu.run_emulation() {
                 // Emulation ran successfully, continue.
-                VcpuEmulation::Handled => {}
+                Ok(VcpuEmulation::Handled) => {}
                 // Emulation was interrupted, check external events.
-                VcpuEmulation::Interrupted => {
+                Ok(VcpuEmulation::Interrupted) => {
                     if time::Instant::now().duration_since(start_time) >= timeout {
                         exit = Some(UnparsedExitReason::Timeout);
                     } else {
@@ -482,10 +493,10 @@ impl NyxVM {
                         exit = Some(UnparsedExitReason::Interrupted);
                     }
                 }
-                VcpuEmulation::Stopped => {
+                Ok(VcpuEmulation::Stopped) => {
                     exit = Some(UnparsedExitReason::Shutdown);
                 }
-                VcpuEmulation::DebugEvent(dbg) => {
+                Ok(VcpuEmulation::DebugEvent(dbg)) => {
                     let regs = self.regs();
                     let exc_reason = match dbg.exception {
                         DBG_EXCEPTION_BREAKPOINT if regs.rax == NYX_LITE => UnparsedExitReason::Hypercall,
@@ -506,7 +517,11 @@ impl NyxVM {
                         excp => {panic!("Unexpected Debug Exception From KVM: {excp} {:x?} ", dbg);}
                     };
                     exit = Some(exc_reason)
-                }
+                },
+                Err(VcpuError::FaultyKvmExit(err)) if err == "Bad address (os error 14)" => {
+                    exit = Some(UnparsedExitReason::BadMemoryAccess)
+                },
+                Err(err) => {panic!("KVM returned unexpected error {:?}", err)}
             }
             while let Ok(ev) = self.vcpu.event_receiver.try_recv() {
                 match ev {
@@ -528,6 +543,7 @@ impl NyxVM {
     pub fn parse_exit_reason(&self, unparsed: VMExitUserEvent) -> ExitReason{
         match unparsed {
             VMExitUserEvent::Hypercall => self.parse_hypercall(),
+            VMExitUserEvent::BadMemoryAccess => self.parse_bad_memory_access(),
             VMExitUserEvent::Interrupted => ExitReason::Interrupted,
             VMExitUserEvent::Breakpoint => ExitReason::Breakpoint,
             VMExitUserEvent::SingleStep => ExitReason::SingleStep,
@@ -549,12 +565,13 @@ impl NyxVM {
         return self.continue_vm(RunMode::SingleStep, timeout);
     }
 
-    pub fn branch_step(&mut self, timeout: Duration) -> ExitReason{
+    pub fn branch_step(&mut self, _timeout: Duration) -> ExitReason{
         panic!("access to MSRs is currently not working as expected")
         // https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/pmu_intel.c
         // TODO figure out how fix this
         // return self.continue_vm(RunMode::BranchStep, timeout);
     }
+
 
     pub fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
         self.breakpoint_manager.add_breakpoint(cr3,vaddr);
@@ -597,7 +614,7 @@ impl NyxVM {
         return res;
     }
 
-    fn set_lbr(&mut self) {
+    pub fn set_lbr(&mut self) {
         panic!("reading lbr doesn't seem to be supported by KVM");
         //let msrs_to_set = [
         //    kvm_msr_entry {
@@ -611,7 +628,7 @@ impl NyxVM {
         //assert_eq!(num_set, msrs_to_set.len());
     }
 
-    fn get_lbr(&mut self){
+    pub fn get_lbr(&mut self){
         panic!("None of this seems supported by KVM?");
         // it appears XSAVE nees AI32_XSS[15] to actually store LBR data, and we can't set AI32_XSS via kvm.
         // let xsave = self.vcpu.kvm_vcpu.fd.get_xsave().unwrap();

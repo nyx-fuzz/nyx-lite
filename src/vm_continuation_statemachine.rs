@@ -12,6 +12,7 @@ pub enum VMExitUserEvent {
     HWBreakpoint(u8),
     SingleStep,
     Interrupted,
+    BadMemoryAccess,
 }
 
 #[derive(Clone,Debug,Eq, PartialEq, Hash)]
@@ -64,6 +65,7 @@ impl VMContinuationState{
         vm.breakpoint_manager.enable_all_breakpoints(&mut vm.vmm.lock().unwrap());
         let exit = vm.run_inner(timeout);
         match exit {
+            UnparsedExitReason::BadMemoryAccess => return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess)),
             UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
             UnparsedExitReason::GuestBreakpoint => return (Self::ForceSingleStepInjectBPs, None),
             UnparsedExitReason::NyxBreakpoint => return (Self::ForceSingleStep, Some(VMExitUserEvent::Breakpoint)),
@@ -94,6 +96,10 @@ impl VMContinuationState{
                     return (Self::Main, Some(VMExitUserEvent::SingleStep))
                 }
                 return (Self::Main, None)
+            }
+            UnparsedExitReason::BadMemoryAccess => {
+                // TODO: I no longer understand what we are doing here - check this actually works
+                return (Self::ForceSingleStep, Some(VMExitUserEvent::BadMemoryAccess))
             }
             UnparsedExitReason::GuestBreakpoint => {
                 // To get here, we triggered a nyx-bp at address X (which we removed). IF there was a breakpoint under
@@ -136,6 +142,10 @@ impl VMContinuationState{
                 return (Self::Main, None)
             }
             UnparsedExitReason::HWBreakpoint(x) => return (Self::Main, Some(VMExitUserEvent::HWBreakpoint(x))),
+            UnparsedExitReason::BadMemoryAccess => {
+                // TODO: I no longer understand what we are doing here - check this actually works
+                return (Self::Main, Some(VMExitUserEvent::BadMemoryAccess))
+            }
             UnparsedExitReason::GuestBreakpoint => {
                 panic!("We shouild never see a breakpoint based vm exit while injecting breakpoints interrupts");
             }

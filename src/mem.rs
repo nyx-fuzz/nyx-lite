@@ -1,8 +1,10 @@
 use core::fmt;
+use std::ffi::c_void;
 use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
 use crate::error::MemoryError;
-use vm_memory::bitmap::{AtomicBitmap, BS};
+use libc::{mprotect, PROT_READ, PROT_WRITE};
+use vm_memory::bitmap::BS;
 use vm_memory::{AtomicAccess, ByteValued, GuestUsize, VolatileSlice};
 use vmm::vstate::memory::{
     Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
@@ -40,6 +42,14 @@ pub fn read_phys_u8(mem: &GuestMemoryMmap, paddr: u64) -> MResult<u8> {
     return read_phys(mem, paddr)
 }
 
+pub enum PagePermission{
+    R,
+    W,
+    RW,
+    None,
+}
+
+
 pub trait NyxMemExtension{
     fn resolve_vaddr(&self, cr3: u64, vaddr: u64) -> MResult<GuestAddress>;
     fn read_virtual<T: ByteValued + AtomicAccess>(&self, cr3: u64, vaddr: u64) -> MResult<T>;
@@ -47,6 +57,9 @@ pub trait NyxMemExtension{
 
     fn read_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64) -> MResult<T>;
     fn write_phys<T: ByteValued + AtomicAccess>(&self, paddr: u64, val: T) -> MResult<()>;
+
+    fn set_physical_page_permission(&mut self, phys_addr: u64, perm: PagePermission);
+    fn set_virtual_page_permission(&mut self, cr3: u64, vaddr: u64, perm: PagePermission);
 
     fn read_virtual_u8(&self, cr3: u64, vaddr: u64) -> MResult<u8>;
     fn write_virtual_u8(&self, cr3: u64, vaddr: u64, val: u8) -> MResult<()>;
@@ -149,6 +162,28 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
             }
         }
         return Ok(num_bytes);
+    }
+
+    fn set_physical_page_permission(&mut self, paddr: u64, perm: PagePermission){
+        let page_addr = paddr & M_PAGE_ALIGN;
+        let region = self.get_mem().find_region(GuestAddress(page_addr)).unwrap();
+        assert!(region.to_region_addr(GuestAddress(page_addr)).is_some());
+        let offset = page_addr - region.start_addr().0 as u64;
+        let prot = match perm {
+            PagePermission::None => 0,
+            PagePermission::R => PROT_READ,
+            PagePermission::W => PROT_WRITE,
+            PagePermission::RW => PROT_READ | PROT_WRITE,
+        };
+        unsafe{
+            let ptr = region.as_ptr().offset(offset as isize);
+            mprotect(ptr as *mut c_void, PAGE_SIZE as usize, prot);
+        }
+    }
+    
+    fn set_virtual_page_permission(&mut self, cr3: u64, vaddr: u64, perm: PagePermission) {
+       let phys_addr = self.resolve_vaddr(cr3, vaddr).unwrap();
+       self.set_physical_page_permission(phys_addr.0, perm);
     }
 }
 
@@ -463,7 +498,7 @@ impl VirtMappedRange {
     ) -> impl Iterator<
         Item = (
             u64,
-            VolatileSlice<'mem, BS<<GuestRegionMmap as GuestMemoryRegion>::B>>,
+            VolatileSlice<'mem, BS<'mem, <GuestRegionMmap as GuestMemoryRegion>::B>>,
         ),
     > + 'mem {
         self.tlb.iter().enumerate().map(|(i, guest_phys_addr)| {

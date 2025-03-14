@@ -11,7 +11,6 @@ PRE RELEASE:
   * Add testing
   * make a generic Reader/Writer implementation for virtual memory
 Debug APIs:
-  * Simulating EPT based memory breakpoints by host mprotect (can crash when device emulation accesses this memory, slow on vmexits)
   * Inject Mapping / Inject Code
   * Explore DS /BTS Branch Trace Storage via MSR_IA32_DEBUGCTLMSR
 Better Memory management
@@ -26,6 +25,7 @@ Loading VMs
     docker first
 
 bugfixes:
+* test and ensure SIMD instructions calculate correct memory accesses for ExitReason::BadMemoryAccess
 * fix BTF Branch Based single step via MSR_IA32_DEBUGCTLMSR
 * fix kvm dirty ring api to speed up snapshots
 * fix host atomic bitmap to speed up snapshots
