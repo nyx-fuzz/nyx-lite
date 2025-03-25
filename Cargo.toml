@@ -33,10 +33,6 @@ path = "src/main.rs"
 name = "e2e_test"
 path = "src/e2e_test_main.rs"
 
-[[example]]
-name = "test_guest_runner"
-path = "examples/test_guest_runner"
-
 [profile.release]
 debug = true
 debug-assertions = true

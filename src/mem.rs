@@ -1,5 +1,6 @@
 use core::fmt;
 use std::ffi::c_void;
+use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::{iter::Peekable, marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
 use crate::error::MemoryError;
@@ -67,7 +68,8 @@ pub trait NyxMemExtension{
     fn write_virtual_u64(&self, cr3: u64, vaddr: u64, val: u64) -> MResult<()>;
     fn read_virtual_cstr(&self, cr3: u64, guest_vaddr: u64) -> Vec<u8>;
 
-    fn read_virtual_bytes<'buffer>(&self, cr3: u64, vaddr: u64, buffer: &'buffer mut[u8]) -> MResult<usize>;
+    fn read_virtual_bytes(&self, cr3: u64, vaddr: u64, buffer: &mut[u8]) -> MResult<usize>;
+    fn write_virtual_bytes(&self, cr3: u64, guest_vaddr: u64, buffer: &[u8]) -> MResult<usize>;
 }
 
 pub trait GetMem{
@@ -164,6 +166,29 @@ impl<GetMemT> NyxMemExtension for GetMemT where GetMemT: GetMem{
         return Ok(num_bytes);
     }
 
+    fn write_virtual_bytes(&self, cr3: u64, guest_vaddr: u64, buffer: &[u8]) -> MResult<usize> {
+        let mem = self.get_mem();
+        let mut num_bytes = 0;
+        for pte in walk_virtual_pages(mem, cr3, guest_vaddr&M_PAGE_ALIGN, M_PAGE_ALIGN){
+            if !pte.present() || pte.missing_page() {
+                return Ok(num_bytes);
+            }
+            let guest_slice = mem.get_slice(pte.phys_addr(), PAGE_SIZE as usize).unwrap();
+            let page_vaddr = pte.vaddrs.start;
+            assert_eq!(guest_slice.len(), PAGE_SIZE as usize);
+            let slice_start = if page_vaddr < guest_vaddr { (guest_vaddr-page_vaddr) as usize } else {0};
+            let buff_slice = &buffer[num_bytes..];
+            let guest_slice = guest_slice.subslice(slice_start, guest_slice.len()-slice_start).unwrap();
+            guest_slice.copy_from(buff_slice);
+            let num_copied = buff_slice.len().min(guest_slice.len());
+            num_bytes += num_copied;
+            if num_copied >= buffer.len() {
+                break;
+            }
+        }
+        return Ok(num_bytes);
+    }
+
     fn set_physical_page_permission(&mut self, paddr: u64, perm: PagePermission){
         let page_addr = paddr & M_PAGE_ALIGN;
         let region = self.get_mem().find_region(GuestAddress(page_addr)).unwrap();
@@ -211,7 +236,7 @@ pub fn resolve_vaddr(mem: &GuestMemoryMmap, cr3: u64, vaddr: u64) -> MResult<u64
 }
 
 // Primary function to walk virtual address spaces. Will merge all adjacent
-// unmapped/incalid pages & only return leave nodes of the page tables
+// unmapped/invalid pages & only return leave nodes of the page tables
 pub fn walk_virtual_pages<'mem>(
     mem: &'mem GuestMemoryMmap,
     cr3: u64,
@@ -447,6 +472,57 @@ impl<'mem, BaseIter: Iterator<Item = PTE>> Iterator for MergedPTEWalker<'mem, Ba
         return Some(cur);
     }
 }
+
+pub struct VirtSpace<'vm>{
+    pub cr3: u64,
+    pub vmm: &'vm Vmm,
+    pub addr: u64,
+}
+
+// currently not a stable feature.
+fn checked_sub_signed(x: u64, y: i64) -> Option<u64>{
+    return x.checked_sub(y as u64);
+}
+
+impl<'vm> Seek for VirtSpace<'vm> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Start(offset) => self.addr = offset,
+            SeekFrom::Current(offset) => {
+                match self.addr.checked_add_signed(offset){
+                    Some(new) => self.addr = new,
+                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+                }
+            }
+            SeekFrom::End(offset) => {
+                match checked_sub_signed(u64::MAX, offset){
+                    Some(new) => self.addr = new,
+                    None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Offset caused address Over/Underflow"))
+                }
+            }
+        }
+        Ok(self.addr)
+    }
+}
+
+impl<'vm> Read for VirtSpace<'vm> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Ok(self.vmm.read_virtual_bytes(self.cr3, self.addr, buf).unwrap())
+    }
+}
+
+impl<'vm> Write for VirtSpace<'vm> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(self.vmm.write_virtual_bytes(self.cr3, self.addr, buf).unwrap())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(()) // No-op for in-memory buffer
+    }
+}
+
+
+
 
 pub struct VirtMappedRange {
     cr3: u64,

@@ -11,6 +11,7 @@ use std::fs::{self};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -18,8 +19,9 @@ use anyhow::Result;
 use libc::{pthread_t, SIGSTOP};
 use nyx_lite::disassembly::{self, disassemble_print};
 use nyx_lite::mem::{NyxMemExtension, PagePermission};
+use nyx_lite::snapshot::NyxSnapshot;
 use nyx_lite::vm_continuation_statemachine::VMContinuationState;
-use nyx_lite::{BaseSnapshot, ExitReason, NyxVM};
+use nyx_lite::{ExitReason, NyxVM};
 use utils::arg_parser::{ArgParser, Argument};
 use utils::signal::Killable;
 use utils::validators::validate_instance_id;
@@ -151,6 +153,8 @@ fn main_exec() -> Result<()> {
     test_mem_bp(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure we trigger vm exits by mprotect");
     test_mem_permissions(&mut vm, shared_vaddr, &snapshot);
+    info!("TEST: Ensure incremental snapshots work");
+    test_incremental_snapshot(&mut vm, shared_vaddr, &snapshot);
     info!("TEST: Ensure VM shuts down cleanly");
     test_shutdown(&mut vm, shared_vaddr, &snapshot);
     info!("RAN ALL TESTS SUCCESSFULLY");
@@ -191,7 +195,7 @@ pub fn test_boot_shared_mem(vm: &mut NyxVM) -> u64 {
     }
 }
 
-pub fn test_make_snapshot(vm: &mut NyxVM, saddr: u64) -> BaseSnapshot {
+pub fn test_make_snapshot(vm: &mut NyxVM, saddr: u64) -> Arc<NyxSnapshot> {
     let val = vm.read_current_u64(saddr);
     assert_eq!(val, 0x44434241);
     let timeout = Duration::from_millis(100);
@@ -222,7 +226,7 @@ pub fn test_rw_shared_mem(vm: &mut NyxVM, saddr: u64) {
     assert_eq!(val, 0xb3d4f51738597a91, "expected the guest to increment memory, got {val:x}");
 }
 
-pub fn test_snapshot_tsc(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_snapshot_tsc(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     let mut pre_timestamps = vec![];
     let mut post_timestamps = vec![];
     // since tsc is quite noisy, we'll run a couple of times and assert that the
@@ -259,7 +263,8 @@ pub fn test_snapshot_tsc(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnaps
     assert!(!post_monotonic || post_all_equal, "tsc values shouldn't be increasing monotonically - this indicates the clock doesn't get set back properly")
 }
 
-pub fn test_timeout(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+
+pub fn test_timeout(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+3);
     let start_time = Instant::now();
@@ -272,7 +277,7 @@ pub fn test_timeout(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) 
     };
 }
 
-pub fn test_subprocess(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_subprocess(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+4);
     let exit_reason = run_vm_test(vm, 500, "test_subprocess: ensure the guest can spawn new processes");
@@ -282,7 +287,7 @@ pub fn test_subprocess(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsho
     };
 }
 
-pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     // run twice to ensure the files get reset correctly
     // test writes
     for _ in 0..2 {
@@ -311,7 +316,7 @@ pub fn test_filesystem_reset(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseS
     }
 }
 
-pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
     let exit_reason = run_vm_test(vm, 100, "test_single_step: test get to known code for singlestep");
@@ -362,7 +367,7 @@ pub fn test_single_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsh
 }
 
 /*
-pub fn test_branch_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_branch_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &NyxSnapshot) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+10);
     let exit_reason = run_vm_test(vm, 100, "test_single_step_branch: test code for singlestep in branch mode");
@@ -412,7 +417,7 @@ pub fn test_branch_step(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsh
     assert_eq!(vm.regs().rip, code_addr + 15); 
 } */
 
-pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>){
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
 
@@ -538,7 +543,7 @@ pub fn test_host_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
     vm.remove_all_breakpoints();
 }
 
-pub fn test_host_hw_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+pub fn test_host_hw_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>){
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+7);
 
@@ -584,7 +589,7 @@ pub fn test_host_hw_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapsho
     };
 }
 
-pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+8);
     let exit_reason = run_vm_test(vm, 100, "test_guest_bp: run until first hypercall");
@@ -598,7 +603,7 @@ pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot)
             panic!("unexpected exit {exit_reason:?}");
         }
     };
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: ensure that the breakpoints are triggering the signal handler");
+    let exit_reason = run_vm_test(vm, 100, "test_guest_bp: ensure that the breakpoints are triggering the signal handler");
     match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => {
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -611,7 +616,7 @@ pub fn test_guest_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot)
     };
 }
 
-pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>){
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+9); 
     let exit_reason = run_vm_test(vm, 100, "test_mem_bp: trying to get guest pointer");
@@ -656,10 +661,10 @@ pub fn test_mem_bp(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
         _ => panic!("unexpected exit {exit_reason:?}")
     };
 }
-pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot){
+pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>){
     vm.apply_snapshot(snapshot);
-    vm.write_current_u64(shared_vaddr, TEST_NUM+9); // subprocess will do a bunch of branches
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: trying to get guest pointer");
+    vm.write_current_u64(shared_vaddr, TEST_NUM+9); // subprocess will read/write a bunch of data
+    let exit_reason = run_vm_test(vm, 100, "test_mem_permissions: trying to get guest pointer");
     let (offset, data) = match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -671,13 +676,13 @@ pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSn
     let cr3 = vm.sregs().cr3;
     vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::None);
     vm.write_current_u64(offset, 0x1000); // access data + 0x1000
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_permissions: read offset");
     match exit_reason {
         ExitReason::BadMemoryAccess(vec) => {assert_eq!(vec, [(data+0x1000*8, disassembly::OpAccess::Read)])},
         _ => panic!("unexpected exit {exit_reason:?}")
     };
     vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::R);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: read offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_permissions: read offset");
     match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -686,13 +691,13 @@ pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSn
         },
         _ => panic!("unexpected exit {exit_reason:?}")
     };
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_permissions: write offset");
     match exit_reason {
         ExitReason::BadMemoryAccess(vec) => {assert_eq!(vec, [(data+0x1000*8, disassembly::OpAccess::Write)])},
         _ => panic!("unexpected exit {exit_reason:?}")
     };
     vm.vmm.lock().unwrap().set_virtual_page_permission(cr3, data+0x1000*8, PagePermission::RW);
-    let exit_reason = run_vm_test(vm, 100, "test_subprocess: write offset");
+    let exit_reason = run_vm_test(vm, 100, "test_mem_permissions: write offset");
     match exit_reason {
         ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
             assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
@@ -705,7 +710,40 @@ pub fn test_mem_permissions(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSn
 
 
 
-pub fn test_shutdown(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &BaseSnapshot) {
+pub fn test_incremental_snapshot(vm: &mut NyxVM, shared_vaddr: u64, base_snapshot: &Arc<NyxSnapshot>) {
+    fn run_test_iter(vm: &mut NyxVM, i: u64, data: u64){
+        let exit_reason = run_vm_test(vm, 100, &format!("test_incremental: iter {i}"));
+        match exit_reason {
+            ExitReason::Hypercall(num, arg1, arg2, _arg3, _arg4) => { 
+                assert_eq!(num, DBG_CODE, "unexpected hypercall number: hypercall_dbg_code should use num {DBG_CODE:x}");
+                assert_eq!(arg1, i);
+                assert_eq!(arg2, data);
+            },
+            _ => panic!("unexpected exit {exit_reason:?}")
+        };
+    }
+    vm.apply_snapshot(base_snapshot);
+    assert!(!base_snapshot.memory.is_incremental());
+    vm.write_current_u64(shared_vaddr, TEST_NUM+11);
+    run_test_iter(vm, 0, 999);
+    let snap_1 = vm.take_snapshot();
+    run_test_iter(vm, 1, 0);
+    let snap_2 = vm.take_snapshot();
+    run_test_iter(vm, 2, 1);
+    let snap_3 = vm.take_snapshot();
+    run_test_iter(vm, 3, 2);
+    vm.apply_snapshot(&snap_1);
+    run_test_iter(vm, 1, 0);
+    run_test_iter(vm, 2, 1);
+    run_test_iter(vm, 3, 2);
+    vm.apply_snapshot(&snap_3);
+    run_test_iter(vm, 3, 2);
+    vm.apply_snapshot(&snap_2);
+    run_test_iter(vm, 2, 1);
+}
+
+
+pub fn test_shutdown(vm: &mut NyxVM, shared_vaddr: u64, snapshot: &Arc<NyxSnapshot>) {
     vm.apply_snapshot(snapshot);
     vm.write_current_u64(shared_vaddr, TEST_NUM+9999);
     let exit_reason = run_vm_test(vm, 100, "test_shutdown: ensure that the vm can respond to shutdown cleanly");

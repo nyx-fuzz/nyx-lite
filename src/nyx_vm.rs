@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -8,13 +9,11 @@ use anyhow::Result;
 
 use event_manager::SubscriberOps;
 use iced_x86::OpAccess;
-use vmm::arch::DeviceType;
+use vmm::arch::{DeviceType, PAGE_SIZE};
 use vmm::arch_gen::x86::msr_index::{MSR_IA32_DEBUGCTLMSR, MSR_IA32_TSC, MSR_IA32_TSCDEADLINE, MSR_IA32_TSC_ADJUST};
 use vmm::device_manager::mmio::MMIODeviceManager;
 use vmm::devices::virtio::block::device::Block;
 use vmm::devices::virtio::block::persist::BlockState;
-use vmm::devices::virtio::block::virtio::persist::VirtioBlockState;
-use vmm::devices::virtio::device::VirtioDevice;
 use vmm::devices::virtio::queue::Queue;
 use vmm::devices::virtio::TYPE_BLOCK;
 use vmm::logger::debug;
@@ -22,7 +21,7 @@ use vmm::persist::MicrovmState;
 use vmm::resources::VmResources;
 use vmm::snapshot::Persist;
 use vmm::vmm_config::instance_info::{InstanceInfo, VmState};
-use vmm::vstate::memory::GuestMemoryExtension;
+use vmm::vstate::memory::{GuestMemoryExtension, GuestRegionMmap};
 use vmm::vstate::memory::{
     Bitmap, Bytes, GuestAddress, GuestMemory, GuestMemoryRegion, MemoryRegionAddress,
 };
@@ -41,9 +40,10 @@ use crate::breakpoints::{BreakpointManager, BreakpointManagerTrait};
 use crate::disassembly::disassemble_memory_accesses;
 use crate::firecracker_wrappers::build_microvm_for_boot;
 use crate::hw_breakpoints::HwBreakpoints;
+use crate::snapshot::{MemorySnapshot, NyxSnapshot, SnapshotType};
 use crate::timer_event::TimerEvent;
 use crate::vm_continuation_statemachine::{RunMode, VMContinuationState, VMExitUserEvent};
-use crate::mem::{self, NyxMemExtension};
+use crate::mem::{self, GetMem, NyxMemExtension};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub enum DebugState{
@@ -73,37 +73,9 @@ pub struct NyxVM {
     pub continuation_state: VMContinuationState,
     pub breakpoint_manager: Box<dyn BreakpointManagerTrait>,
     pub hw_breakpoints: HwBreakpoints,
+    pub active_snapshot: Option<Arc<NyxSnapshot>>,
 }
 
-pub struct BlockDeviceSnapshot {
-    state: VirtioBlockState,
-}
-
-impl BlockDeviceSnapshot {
-    pub fn from(blockdevice: &Arc<Mutex<Block>>) -> Self {
-        let locked = blockdevice.lock().unwrap();
-        if let BlockState::Virtio(state) = locked.save() {
-            return Self { state };
-        }
-        panic!("taking snapshots only works for virtio block devices");
-    }
-    pub fn apply_to(&self, blockdevice: &Arc<Mutex<Block>>) {
-        let mut locked = blockdevice.lock().unwrap();
-        let dstate = &self.state.virtio_state;
-        locked.set_acked_features(dstate.acked_features);
-        for (queue, snap) in locked.queues_mut().iter_mut().zip(dstate.queues.iter()) {
-            let new_queue = Queue::restore((), snap).unwrap();
-            let _ = std::mem::replace(queue, new_queue);
-        }
-    }
-}
-
-pub struct BaseSnapshot {
-    memory: Vec<u8>,
-    state: MicrovmState,
-    tsc: u64,
-    continuation_state: VMContinuationState
-}
 
 #[derive(Debug)]
 pub enum UnparsedExitReason {
@@ -210,21 +182,54 @@ impl NyxVM {
             continuation_state: VMContinuationState::Main,
             breakpoint_manager: Box::new(BreakpointManager::new()),
             hw_breakpoints: HwBreakpoints::new(),
+            active_snapshot: None,
         };
     }
 
-    pub fn take_snapshot(&mut self) -> BaseSnapshot {
-        let vmm = self.vmm.lock().unwrap();
+    pub fn take_memory_snapshot(vmm: &Vmm, snap_type: SnapshotType) -> MemorySnapshot {
+        let memory = match snap_type {
+        SnapshotType::Base => {
+            assert_eq!(vmm.guest_memory().num_regions(), 1);
+            let region = vmm.guest_memory().find_region(GuestAddress(0)).unwrap();
+            let region_len: usize = region.len().try_into().unwrap();
+            let mut memory = vec![0; region_len];
+            region
+                .read_slice(&mut memory, MemoryRegionAddress(0))
+                .unwrap();
+            MemorySnapshot::Base(memory)
+        },
+        SnapshotType::Incremental => {
+            let mut map = HashMap::new();
+            Self::iter_dirty_pages(vmm, |region, page_addr|{
+                let mut data = vec![0; PAGE_SIZE as usize];
 
-        let region = vmm.guest_memory().find_region(GuestAddress(0)).unwrap();
-        let region_len: usize = region.len().try_into().unwrap();
-        let mut memory = vec![0; region_len];
-        region
-            .read_slice(&mut memory, MemoryRegionAddress(0))
-            .unwrap();
+                region.read_slice(&mut data, MemoryRegionAddress(page_addr as u64)).unwrap();
+                map.insert(page_addr as u64, data);
+            });
+            MemorySnapshot::Incremental(map)
+        }};
 
         vmm.guest_memory().reset_dirty();
         vmm.reset_dirty_bitmap();
+        return memory;
+    }
+
+    pub fn take_snapshot(&mut self) -> Arc<NyxSnapshot> {
+        let snap_type = if self.active_snapshot.is_some() { SnapshotType::Incremental } else {SnapshotType::Base};
+        return self.take_snapshot_with_type(snap_type);
+    }
+
+    pub fn take_base_snapshot(&mut self) -> Arc<NyxSnapshot> {
+        return self.take_snapshot_with_type(SnapshotType::Base);
+    }
+
+    pub fn take_snapshot_with_type(&mut self, snap_type: SnapshotType) -> Arc<NyxSnapshot>{
+        let vmm = self.vmm.lock().unwrap();
+
+        if snap_type == SnapshotType::Incremental {
+            assert!(self.active_snapshot.is_some(), "can't take an incremental snapshot without a basis snapshot!");
+        }
+        let memory = Self::take_memory_snapshot(&vmm, snap_type);
 
         //let block_device_snapshots = self.block_devices.iter().map(|dev| {
         //    // This flushes all changes to the backing file
@@ -246,12 +251,18 @@ impl NyxVM {
             ])
             .unwrap();
         let tsc = msrs[&MSR_IA32_TSC];
-        return BaseSnapshot {
+        let parent = self.active_snapshot.take();
+        let depth = parent.as_ref().map(|p| p.depth+1).unwrap_or(0);
+        let new_snap =  Arc::new(NyxSnapshot {
+            parent,
+            depth, 
             memory,
             state: self.save_vm_state(&vmm),
             tsc,
             continuation_state: self.continuation_state.clone()
-        };
+        });
+        self.active_snapshot = Some(new_snap.clone());
+        return new_snap;
     }
 
     fn save_vm_state(&self, vmm: &Vmm) -> MicrovmState {
@@ -272,7 +283,7 @@ impl NyxVM {
         };
     }
 
-    fn apply_snapshot_mmio(mmio: &MMIODeviceManager, snap: &BaseSnapshot) {
+    fn apply_snapshot_mmio(mmio: &MMIODeviceManager, snap: &NyxSnapshot) {
         let ds = &snap.state.device_states;
         let blocks = &ds.block_devices;
         for block_snap in blocks.iter() {
@@ -334,9 +345,10 @@ impl NyxVM {
         //println!("MSRS: TSC {:x} (snapshot: {:x}) TSCDEADLINE {:x} TSC_ADJUST {:x}", msrs[&MSR_IA32_TSC], snap.tsc, msrs[&MSR_IA32_TSCDEADLINE], msrs[&MSR_IA32_TSC_ADJUST]);
     }
 
-    pub fn apply_snapshot(&mut self, snapshot: &BaseSnapshot) {
-        let mut vmm = self.vmm.lock().unwrap();
-
+    /// callback will be called with the guest memory GuestRegionMmap oject and
+    /// the physical address of the dirty page once for every dirty page
+    pub fn iter_dirty_pages<Callback>(vmm: &Vmm, mut callback: Callback) 
+    where Callback: FnMut(&GuestRegionMmap, usize) {
         let kvm_dirty_bitmap = vmm.get_dirty_bitmap().unwrap();
         let page_size: usize = mem::PAGE_SIZE as usize;
 
@@ -348,21 +360,81 @@ impl NyxVM {
                 for j in 0..64 {
                     let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
                     let index: usize = (i * 64) + j;
-                    let page_offset = index * page_size;
-                    let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+                    let page_addr = index * page_size;
+                    let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_addr);
 
                     if is_kvm_page_dirty || is_firecracker_page_dirty {
-                        let target_addr = MemoryRegionAddress(page_offset.try_into().unwrap());
-                        let source_slice = &snapshot
-                            .memory
-                            .get(page_offset..page_offset + page_size)
-                            .unwrap();
-                        region.write_slice(source_slice, target_addr).unwrap();
+                        callback(region, page_addr);
                     }
                 }
             }
         }
+    }
 
+    fn apply_deltas_to_least_common_ancestor(vmm: &mut Vmm, mut pages_reset: &mut HashSet<u64>, active: Arc<NyxSnapshot>, snapshot: Arc<NyxSnapshot>){
+        let mut active_ancestor = active.clone();
+        let mut snap_ancestor = snapshot.clone();
+        let mem = vmm.get_mem();
+        // for every delta in a parent of snapshot, we can apply it directly
+        let reset_snap_pages = |snap_ancestor: Arc<NyxSnapshot>, reset_pages: &mut HashSet<u64>|{
+            for (page,slice) in snap_ancestor.iter_delta(){
+                if !reset_pages.contains(&page){
+                    reset_pages.insert(page);
+                    mem.write_slice(slice, GuestAddress(page)).unwrap();
+                }
+            }
+            snap_ancestor.parent.as_ref().expect("Only snapshots with depth 0 can be root snapshots").clone()
+        };
+        // however, for deltas in the parent of the currently active snapshot, we need to reset them to the same page from snapshot instead.
+        let reset_active_pages = |active_ancestor: Arc<NyxSnapshot>, reset_pages: &mut HashSet<u64>|{
+            for (page,_) in active_ancestor.iter_delta(){
+                if !reset_pages.contains(&page){
+                    reset_pages.insert(page);
+                    snapshot.get_page(page as usize, |slice|{
+                        mem.write_slice(slice, GuestAddress(page)).unwrap();
+                    });
+                }
+            }
+            active_ancestor.parent.as_ref().expect("Only snapshots with depth 0 can be root snapshots").clone()
+        };
+        // first we make sure cur and active are on the same depth
+        while snap_ancestor.depth > active_ancestor.depth {
+            snap_ancestor = reset_snap_pages(snap_ancestor, &mut pages_reset);
+        }
+        while active_ancestor.depth > snap_ancestor.depth {
+            active_ancestor = reset_active_pages(active_ancestor, &mut pages_reset);
+        }
+        // once they are on the same depth we can walk both of them upwards until they meet and we reset all pages to the LCA
+        while !Arc::ptr_eq(&active_ancestor, &snap_ancestor){
+            assert_eq!(active.depth, snap_ancestor.depth);
+            active_ancestor = reset_active_pages(active_ancestor, &mut pages_reset);
+            snap_ancestor =reset_snap_pages(snap_ancestor, &mut pages_reset);
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, snapshot: &Arc<NyxSnapshot>) {
+        let mut vmm = self.vmm.lock().unwrap();
+
+        let mut pages_reset = HashSet::new();
+        let active_snapshot = self.active_snapshot.as_ref().expect("can only apply snapshots on VMs with an active snapshot");
+
+        let fast_path = Arc::ptr_eq(snapshot, active_snapshot);
+
+        Self::iter_dirty_pages(&mut vmm, |region, page_addr|{
+            let target_addr = MemoryRegionAddress(page_addr.try_into().unwrap());
+            snapshot.get_page(page_addr, |slice| { 
+                region.write_slice(slice, target_addr).unwrap();
+                if !fast_path{
+                    pages_reset.insert(page_addr as u64);
+                }
+            } );
+        });
+
+        if !fast_path {
+            Self::apply_deltas_to_least_common_ancestor(&mut vmm, &mut pages_reset, active_snapshot.clone(), snapshot.clone());
+        } 
+
+        self.active_snapshot = Some(snapshot.clone());
         vmm.guest_memory().reset_dirty();
 
         // The only ACPIDevice is the vmgenid device which we disable - no need to restore
@@ -565,12 +637,7 @@ impl NyxVM {
         return self.continue_vm(RunMode::SingleStep, timeout);
     }
 
-    pub fn branch_step(&mut self, _timeout: Duration) -> ExitReason{
-        panic!("access to MSRs is currently not working as expected")
-        // https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/pmu_intel.c
-        // TODO figure out how fix this
-        // return self.continue_vm(RunMode::BranchStep, timeout);
-    }
+
 
 
     pub fn add_breakpoint(&mut self, cr3: u64, vaddr: u64) {
@@ -612,6 +679,13 @@ impl NyxVM {
             assert_eq!(bytes_copied, num_bytes); 
         }
         return res;
+    }
+
+    pub fn branch_step(&mut self, _timeout: Duration) -> ExitReason{
+        panic!("access to MSRs is currently not working as expected")
+        // https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/pmu_intel.c
+        // TODO figure out how fix this
+        // return self.continue_vm(RunMode::BranchStep, timeout);
     }
 
     pub fn set_lbr(&mut self) {

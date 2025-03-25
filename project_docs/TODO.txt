@@ -16,8 +16,6 @@ Debug APIs:
 Better Memory management
   * Use userfault_fd / signals to allow to have both EPT based breakpoints & shared root snapshots
   * Reduce unnecessary memory by making root snapshot shared between VMs 
-Incremental snapshots  (p1)
-  * snapshot tree api
 Loading VMs
   * fix add api to load dockerfiles directly
   * investigate mke2fs to turn docker image into fs image
