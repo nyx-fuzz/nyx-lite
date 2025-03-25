@@ -1,0 +1,7 @@
+[submodule "vendor/firecracker-nyx-patches"]
+	path = vendor/firecracker-nyx-patches
+	url = git@github.com:nyx-fuzz/nyx-lite-firecracker.git
+	branch = nyx-patches
+[submodule "test-binaries"]
+	path = test-binaries
+	url = git@github.com:nyx-fuzz/nyx-lite-test-binaries.git
